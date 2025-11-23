@@ -1,0 +1,49 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>RJS Game Boy WebGL</title>
+  <style>
+    body { background:#111; margin:0; display:flex; align-items:center; justify-content:center; height:100vh; }
+    canvas { image-rendering: pixelated; border:1px solid #444; }
+  </style>
+</head>
+<body>
+  <canvas id="gb"></canvas>
+  <div id="debugPanel">
+    <canvas id="vramView"></canvas>
+    <canvas id="paletteView" width="200" height="60"></canvas>
+    <button id="refreshDebug">Refresh VRAM / Palette</button>
+  </div>
+	<script src="rjs-compiler.min.js"></script>
+	  <script>
+		// โหลด CPU ก่อน แล้วค่อยโหลดตัว WebGL / Emulator
+		RJS.load("gb_emu_cpu.rjs")
+		  .then(() => RJS.load("gb_emu_webgl.rjs"))
+		  .then(() => {
+			const emu = createGbEmu("gb");
+			window._gb = emu;
+
+			// tetris.gb ต้องอยู่โฟลเดอร์เดียวกับ html นี้
+			return emu.loadRomFromUrl("tetris.gb");
+		  })
+		  .then(() => {
+			_gb.start();
+		  })
+		  .catch((err) => {
+			console.error("GBEmu init error:", err);
+		  });
+		  
+		  
+		    document.getElementById("refreshDebug").addEventListener("click", () => {
+    if (window._gb) {
+      _gb.debugDrawVramTiles("vramView");
+      _gb.debugDrawPalettes("paletteView");
+    }
+  });
+	  </script>
+
+
+
+</body>
+</html>

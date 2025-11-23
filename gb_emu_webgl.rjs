@@ -1,0 +1,849 @@
+// Game Boy WebGL Emulator Skeleton - RJS Full Compact
+/*!
+ * 
+ * RJS - Revolution JavaScript
+ * © Peacedeveloper. All rights reserved.
+ * https://peacedeveloper1.github.io/rjs/
+ * peacedeveloper@gmail.com
+ * This file is part of the RJS language and loader.
+ * Unauthorized copying, modification, or distribution is prohibited.
+ */
+
+GB_SCREEN_W :: 160
+GB_SCREEN_H :: 144
+GB_SCALE    :: 4
+GB_CPU_HZ   :: 4194304
+
+:c GBMemory
+  :n ()
+    :@bytes := :N Uint8Array(0x10000)
+
+    // debug VRAM write
+    :@debugVram       := :(
+    :@debugVramMax    := 200
+    :@debugVramCount  := 0
+  :e
+
+
+  :m reset()
+    :@bytes.fill(0)
+
+    b := :@bytes
+    // basic post-BIOS defaults for LCD / scroll / palette
+    b[0xFF40] = 0x91  // LCDC on, BG on
+    b[0xFF42] = 0x00  // SCY
+    b[0xFF43] = 0x00  // SCX
+    b[0xFF47] = 0xFC  // BGP palette
+  :e
+
+  :m loadRom(romBytes)
+    :* (let i = 0; i < romBytes.length; i++)
+      :@bytes[i] = romBytes[i]
+    :e
+  :e
+
+  :m rb(addr)
+    :^ :@bytes[addr & 0xFFFF]
+  :e
+
+  :m wb(addr, val)
+    addr = addr & 0xFFFF
+    val  = val & 0xFF
+    :@bytes[addr] = val
+
+    // debug: log การเขียน VRAM ช่วง 0x8000–0x9FFF แบบ limit
+    if (:@debugVram && addr >= 0x8000 && addr < 0xA000)
+      if (:@debugVramCount < :@debugVramMax)
+        console.log(
+          "VRAM write",
+          "addr=0x" + addr.toString(16),
+          "val=" + val
+        )
+        :@debugVramCount++
+        if (:@debugVramCount == :@debugVramMax)
+          console.log("VRAM write log limit reached")
+        :e
+      :e
+    :e
+  :e
+
+:e
+
+
+:c GBPPU
+  :n ()
+    :@width  := GB_SCREEN_W
+    :@height := GB_SCREEN_H
+    :@frameBuffer := :N Uint8Array(GB_SCREEN_W * GB_SCREEN_H * 4)
+    :@frameCount  := 0
+    :@mem := :$     // จะถูก attach จาก GBEmu
+  :e
+
+  :m attachMemory(mem)
+    :@mem = mem
+  :e
+
+  :m reset()
+    :@frameCount = 0
+    fb := :@frameBuffer
+    size := fb.length
+    :* (let i = 0; i < size; i++)
+      fb[i] = 0
+    :e
+  :e
+
+  :m clearScreen(shade)
+    fb := :@frameBuffer
+    size := :@width * :@height
+    :* (let i = 0; i < size; i++)
+      j := i * 4
+      fb[j]     = shade
+      fb[j + 1] = shade
+      fb[j + 2] = shade
+      fb[j + 3] = 255
+    :e
+  :e
+
+    // VRAM debug renderer: ไม่สน LCDC / BGP / SCX/SCY ก่อน
+  // อ่าน BG map 0x9800 + tile data 0x8000 → ใช้ colorIndex เป็น shade ตรง ๆ
+  :m renderBG()
+    mem := :@mem
+    fb  := :@frameBuffer
+    w   := :@width
+    h   := :@height
+
+    if (!mem)
+      // ถ้ายังไม่มี memory ให้ล้างจอดำ ๆ ไว้ก่อน
+      size := w * h
+      :* (let i = 0; i < size; i++)
+        j := i * 4
+        fb[j]     = 0
+        fb[j + 1] = 0
+        fb[j + 2] = 0
+        fb[j + 3] = 255
+      :e
+      :^
+    :e
+
+    tileMapBase  := 0x9800   // BG map เดียว (ไม่สน LCDC bit3 ตอนนี้)
+    tileDataBase := 0x8000   // ใช้โหมด unsigned 0..255 ตรง ๆ
+
+    :* (let y = 0; y < h; y++)
+      tileRow := (y >> 3) & 31
+      fineY   := y & 7
+
+      :* (let x = 0; x < w; x++)
+        tileCol := (x >> 3) & 31
+        fineX   := 7 - (x & 7)   // bit 7..0 ซ้าย→ขวา
+
+        mapIndex := tileRow * 32 + tileCol
+        tIndex   := mem.rb(tileMapBase + mapIndex)    // 0..255
+
+        tileAddr := tileDataBase + tIndex * 16
+        lowByte  := mem.rb(tileAddr + fineY * 2)
+        highByte := mem.rb(tileAddr + fineY * 2 + 1)
+
+        bit  := (lowByte  >> fineX) & 1
+        bit2 := (highByte >> fineX) & 1
+        colorIndex := (bit2 << 1) | bit   // 0..3
+
+        // DEBUG: map 0..3 → 0, 85, 170, 255 (ไม่ใช้ BGP เลย)
+        shade := colorIndex * 85
+
+        idx := (y * w + x) * 4
+        fb[idx]     = shade
+        fb[idx + 1] = shade
+        fb[idx + 2] = shade
+        fb[idx + 3] = 255
+      :e
+    :e
+  :e
+
+
+
+  // เรนเดอร์ BG จาก VRAM + tile map
+  // ถ้า LCDC ยังไม่ on จะ fallback เป็น XOR pattern เดิม
+    :m renderBGorigin()
+    mem := :@mem
+    fb  := :@frameBuffer
+    w   := :@width
+    h   := :@height
+
+    if (!mem)
+      size := w * h
+      :* (let i = 0; i < size; i++)
+        j := i * 4
+        fb[j]     = 0
+        fb[j + 1] = 0
+        fb[j + 2] = 0
+        fb[j + 3] = 255
+      :e
+      :^
+    :e
+
+    lcdc := mem.rb(0xFF40)
+
+    scy := mem.rb(0xFF42)
+    scx := mem.rb(0xFF43)
+    bgp := mem.rb(0xFF47)
+
+    // BG tile map base: 0x9800 หรือ 0x9C00 (ตาม LCDC bit3)
+    tileMapBase := 0x9800
+    if (lcdc & 0x08) tileMapBase = 0x9C00
+
+    // *** TEMP: บังคับใช้ tile data ที่ 0x8000 แบบ unsigned index ***
+    tileDataBase := 0x8000
+    signedIndexMode := :(   // ปิดโหมด signed ไปก่อน
+
+    if (!(lcdc & 0x10))
+      tileDataBase = 0x8800
+      signedIndexMode = :)
+    :e
+
+
+    :* (let y = 0; y < h; y++)
+      mapY := (y + scy) & 0xFF
+      tileRow := (mapY >> 3) & 31
+      fineY := mapY & 7
+
+      :* (let x = 0; x < w; x++)
+        mapX := (x + scx) & 0xFF
+        tileCol := (mapX >> 3) & 31
+        fineX := 7 - (mapX & 7)   // bit 7..0
+
+        mapIndex := tileRow * 32 + tileCol
+        tileIndexAddr := tileMapBase + mapIndex
+        tIndex := mem.rb(tileIndexAddr)  // 0..255
+
+        tileAddr := tileDataBase + tIndex * 16
+
+
+        if (signedIndexMode)
+          if (tIndex >= 128) tIndex = tIndex - 256
+          tileAddr = 0x9000 + tIndex * 16
+        :e
+        if (!signedIndexMode)
+          tileAddr = tileDataBase + tIndex * 16
+        :e
+
+        lowByte  := mem.rb(tileAddr + fineY * 2)
+        highByte := mem.rb(tileAddr + fineY * 2 + 1)
+
+        bit  := (lowByte  >> fineX) & 1
+        bit2 := (highByte >> fineX) & 1
+        colorIndex := (bit2 << 1) | bit
+
+        cvalue := 0
+        :~ colorIndex
+          :! 0
+            cvalue = bgp & 0x03
+          :! 1
+            cvalue = (bgp >> 2) & 0x03
+          :! 2
+            cvalue = (bgp >> 4) & 0x03
+          :! 3
+            cvalue = (bgp >> 6) & 0x03
+          :_
+            cvalue = 0
+        :e
+
+        shade := 0
+        :~ cvalue
+          :! 0
+            shade = 255
+          :! 1
+            shade = 192
+          :! 2
+            shade = 96
+          :! 3
+            shade = 0
+          :_
+            shade = 0
+        :e
+		
+		//debug 
+		if (x == 0 && y == 0 && :@frameDebug && ((:@frameNo & 63) == 0))
+          console.log("BG(0,0)", "tIndex=", tIndex,
+            "tileAddr=0x" + tileAddr.toString(16),
+            "low=", lowByte, "high=", highByte,
+            "bgp=0x" + bgp.toString(16))
+        :e
+		        // DEBUG: log แค่ pixel (0,0) ทุก ๆ 64 เฟรม ถ้าเปิด frameDebug
+        if (x == 0 && y == 0 && :@mem && (typeof _gb !== "undefined") && _gb.frameDebug)
+          if ((_gb.frameNo & 63) == 0)
+            console.log(
+              "DBG PIX (0,0)",
+              "tIndex=", tIndex,
+              "tileAddr=0x" + tileAddr.toString(16),
+              "low=", lowByte,
+              "high=", highByte,
+              "colorIndex=", colorIndex,
+              "BGP=0x" + bgp.toString(16),
+              "shade=", shade
+            )
+          :e
+        :e
+
+        idx := (y * w + x) * 4
+        fb[idx]     = shade
+        fb[idx + 1] = shade
+        fb[idx + 2] = shade
+        fb[idx + 3] = 255
+
+      :e
+    :e
+
+    // แบบหยาบ ๆ: LY = 0 ตอนต้นเฟรม
+    //mem.wb(0xFF44, 0)
+  :e
+
+  // XOR plasma test pattern เดิม ใช้ fallback เวลา LCD ไม่ on
+  :m renderTestPattern()
+    fb := :@frameBuffer
+    w  := :@width
+    h  := :@height
+
+    t := :@frameCount & 0xFF
+    :@frameCount++
+
+    size := w * h
+    :* (let i = 0; i < size; i++)
+      x := i % w
+      y := (i / w) | 0
+
+      v := (x ^ y ^ t) & 0xFF
+
+      j := i * 4
+      fb[j]     = v
+      fb[j + 1] = v
+      fb[j + 2] = v
+      fb[j + 3] = 255
+    :e
+  :e
+:e
+
+
+
+
+
+
+
+:c GBWebGLRenderer
+  :n (canvasId, w, h, scale)
+    :@canvas := document.getElementById(canvasId)
+    if (!:@canvas) -> :^
+
+    :@width  := w  || GB_SCREEN_W
+    :@height := h  || GB_SCREEN_H
+    :@scale  := scale || GB_SCALE
+
+    :@canvas.width  = :@width  * :@scale
+    :@canvas.height = :@height * :@scale
+
+    :@gl := :@canvas.getContext("webgl")
+    if (!:@gl) -> :^
+
+    :@initProgram()
+    :@initBuffers()
+    :@initTexture()
+  :e
+
+  :m initProgram()
+    gl := :@gl
+
+    vsSource :: `
+      attribute vec2 a_position;
+      attribute vec2 a_texCoord;
+      varying vec2 v_texCoord;
+      void main() {
+        gl_Position = vec4(a_position, 0.0, 1.0);
+        v_texCoord = a_texCoord;
+      }
+    `
+
+    fsSource :: `
+      precision mediump float;
+      varying vec2 v_texCoord;
+      uniform sampler2D u_texture;
+      void main() {
+        gl_FragColor = texture2D(u_texture, v_texCoord);
+      }
+    `
+
+    vs := :@createShader(gl.VERTEX_SHADER, vsSource)
+    fs := :@createShader(gl.FRAGMENT_SHADER, fsSource)
+
+    prog := gl.createProgram()
+    gl.attachShader(prog, vs)
+    gl.attachShader(prog, fs)
+    gl.linkProgram(prog)
+
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+      console.error("Program link failed:", gl.getProgramInfoLog(prog))
+      :^
+    :e
+
+    :@program = prog
+    gl.useProgram(prog)
+
+    :@aPosition := gl.getAttribLocation(prog, "a_position")
+    :@aTexCoord := gl.getAttribLocation(prog, "a_texCoord")
+    :@uTexture  := gl.getUniformLocation(prog, "u_texture")
+	
+	if (:@uTexture)
+      gl.useProgram(prog)
+      gl.uniform1i(:@uTexture, 0)
+    :e
+
+  :e
+
+  :m createShader(type, source)
+    gl := :@gl
+    sh := gl.createShader(type)
+    gl.shaderSource(sh, source)
+    gl.compileShader(sh)
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS))
+      console.error("Shader compile failed:", gl.getShaderInfoLog(sh))
+      :^ :$
+    :e
+    :^ sh
+  :e
+
+    :m initBuffers()
+    gl := :@gl
+
+    // fullscreen quad
+    verts := :N Float32Array([
+      -1, -1,   0, 1,
+       1, -1,   1, 1,
+      -1,  1,   0, 0,
+       1,  1,   1, 0,
+    ])
+
+    buf := gl.createBuffer()
+    :@vbo = buf
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf)
+    gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW)
+
+    stride := 4 * 4
+
+    gl.enableVertexAttribArray(:@aPosition)
+    gl.vertexAttribPointer(:@aPosition, 2, gl.FLOAT, :(, stride, 0)
+
+    gl.enableVertexAttribArray(:@aTexCoord)
+    gl.vertexAttribPointer(:@aTexCoord, 2, gl.FLOAT, :(, stride, 8)
+  :e
+
+
+  :m initTexture()
+    gl := :@gl
+    tex := gl.createTexture()
+    :@texture = tex
+
+    gl.bindTexture(gl.TEXTURE_2D, tex)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+  :e
+
+    :m draw(frameBuffer)
+    gl := :@gl
+    if (!gl || !:@texture || !frameBuffer) -> :^
+
+    // เผื่อบางบราวเซอร์ state แปลก → bind ทุกครั้งให้ชัวร์
+    gl.viewport(0, 0, :@canvas.width, :@canvas.height)
+
+    gl.useProgram(:@program)
+
+    if (:@vbo)
+      gl.bindBuffer(gl.ARRAY_BUFFER, :@vbo)
+      stride := 4 * 4
+      gl.enableVertexAttribArray(:@aPosition)
+      gl.vertexAttribPointer(:@aPosition, 2, gl.FLOAT, :(, stride, 0)
+
+      gl.enableVertexAttribArray(:@aTexCoord)
+      gl.vertexAttribPointer(:@aTexCoord, 2, gl.FLOAT, :(, stride, 8)
+    :e
+
+    gl.activeTexture(gl.TEXTURE0)
+    gl.bindTexture(gl.TEXTURE_2D, :@texture)
+
+    w := GB_SCREEN_W
+    h := GB_SCREEN_H
+
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA,
+      w,
+      h,
+      0,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      frameBuffer
+    )
+
+    gl.clearColor(0, 0, 0, 1)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
+
+    err := gl.getError()
+    if (err != gl.NO_ERROR)
+      console.error("WebGL draw error:", err)
+    :e
+  :e
+
+:e
+
+:c GBEmu
+  :n (canvasId)
+    :@mem := :N GBMemory()
+    :@ppu := :N GBPPU()
+    :@ppu.attachMemory(:@mem)
+    :@cpu := :N GBCPU(:@mem, :@ppu)
+    :@renderer := :N GBWebGLRenderer(canvasId, GB_SCREEN_W, GB_SCREEN_H, GB_SCALE)
+
+    // initial basic state (RAM/IO + PPU)
+    :@mem.reset()
+    :@ppu.reset()
+
+    // PPU timing (approx)
+    :@ppuScanlineCycles := 0
+    :@ppuLY := 0
+    :@mem.wb(0xFF44, 0)  // LY register เริ่มที่ 0
+
+    :@running := :(
+    :@lastTime := 0
+    :@boundFrameLoop := (t) => :@frameLoop(t)
+	
+	 // debug frame log
+    :@frameDebug := :(
+    :@frameNo := 0
+  :e
+  
+    // เติม tile ปลอม ๆ ลง VRAM 0x8000 เพื่อเทสต์ renderBG โดยไม่พึ่งเกม
+    :m debugFillTestTiles()
+    mem := :@mem
+    tileBase := 0x8000
+    tileCount := 256     // ยัด 256 tile แรกให้หมดไปเลย
+
+    :* (let t = 0; t < tileCount; t++)
+      :* (let row = 0; row < 8; row++)
+        pattern := ((t << 3) + row) & 0xFF
+        addr := tileBase + t * 16 + row * 2
+        mem.wb(addr,     pattern)
+        mem.wb(addr + 1, (~pattern) & 0xFF)
+      :e
+    :e
+  :e
+
+  :m debugForceBGTest()
+    // หยุด main loop ก่อน กันไม่ให้ frameLoop มาทับผลเรา
+    :@running = :(
+
+    mem := :@mem
+
+    // 1) ยัด tile ปลอม ๆ ลง 0x8000– ให้ครบช่วง
+    :@debugFillTestTiles()
+
+    // 2) fill BG map 0x9800 ด้วย tile index ไล่ ๆ กันให้เห็นลาย
+    :* (let i = 0; i < 32 * 32; i++)
+      mem.wb(0x9800 + i, i & 0xFF)
+    :e
+
+    // 3) บังคับค่า register จอแบบง่ายสุด
+    // LCDC = 0x91: LCD on, BG on, tile data = 0x8000 (unsigned), BG map = 0x9800
+    mem.wb(0xFF40, 0x91)
+    mem.wb(0xFF42, 0)    // SCY
+    mem.wb(0xFF43, 0)    // SCX
+    mem.wb(0xFF47, 0xE4) // BGP
+
+    // 4) วาด BG ลง framebuffer แล้วส่งเข้า WebGL
+    :@ppu.renderBG()
+    :@renderer.draw(:@ppu.frameBuffer)
+  :e
+
+
+  :m debugDumpState()
+    pc := :@cpu.pc
+    bg0 := :@mem.rb(0x9800)   // BG map ช่องแรก
+    t0  := :@mem.rb(0x8000)   // byte แรกของ tile data
+    ly  := :@mem.rb(0xFF44)
+    lcdc := :@mem.rb(0xFF40)
+    bgp  := :@mem.rb(0xFF47)
+
+    pcHex := pc.toString(16)
+
+    console.log(
+      "PC=0x" + pcHex,
+      " BG[0]=", bg0,
+      " Tile0=", t0,
+      " LY=", ly,
+      " LCDC=0x" + lcdc.toString(16),
+      " BGP=0x" + bgp.toString(16)
+    )
+  :e
+
+    // วาด tile data จาก 0x8000 เป็น grid ลง canvas 2D
+    // วาด VRAM tile 0x8000.. เป็น grid ลง canvas2D
+  :m debugDrawVramTiles(canvasId)
+    canvas := document.getElementById(canvasId)
+    if (!canvas) -> :^
+    ctx := canvas.getContext("2d")
+    if (!ctx) -> :^
+
+    mem := :@mem
+    if (!mem) -> :^
+
+    tileBase := 0x8000
+    tileCount := 256        // 256 tiles แรกพอ
+    tilesAcross := 16
+    tileW := 8
+    tileH := 8
+    scale := 2
+
+    rows := (tileCount + tilesAcross - 1) / tilesAcross | 0
+
+    canvas.width  = tilesAcross * tileW * scale
+    canvas.height = rows * tileH * scale
+
+    ctx.imageSmoothingEnabled = false
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
+
+    :* (let t = 0; t < tileCount; t++)
+      tx := t % tilesAcross
+      ty := (t / tilesAcross) | 0
+      baseAddr := tileBase + t * 16
+
+      :* (let row = 0; row < 8; row++)
+        low  := mem.rb(baseAddr + row * 2)
+        high := mem.rb(baseAddr + row * 2 + 1)
+
+        :* (let col = 0; col < 8; col++)
+          bit  := (low  >> (7 - col)) & 1
+          bit2 := (high >> (7 - col)) & 1
+          colorIndex := (bit2 << 1) | bit   // 0..3
+
+          shade := 0
+          :~ colorIndex
+            :! 0 
+				shade = 255
+            :! 1 
+				shade = 192
+            :! 2 
+				shade = 96
+            :! 3 
+				shade = 0
+          :e
+
+          x := tx * tileW * scale + col * scale
+          y := ty * tileH * scale + row * scale
+
+          ctx.fillStyle = "rgb(" + shade + "," + shade + "," + shade + ")"
+          ctx.fillRect(x, y, scale, scale)
+        :e
+      :e
+    :e
+  :e
+
+
+     :m debugDrawPalettes(canvasId)
+    canvas := document.getElementById(canvasId)
+    if (!canvas) -> :^
+    ctx := canvas.getContext("2d")
+    if (!ctx) -> :^
+
+    mem := :@mem
+    bgp  := mem.rb(0xFF47)
+    obp0 := mem.rb(0xFF48)
+    obp1 := mem.rb(0xFF49)
+
+    sw := 20
+    sh := 16
+    width  := 4 * sw + 40
+    height := 3 * sh + 10
+
+    canvas.width  = width
+    canvas.height = height
+
+    ctx.imageSmoothingEnabled = false
+    ctx.clearRect(0, 0, width, height)
+    ctx.font = "12px monospace"
+    ctx.fillStyle = "#ffffff"
+
+    ctx.fillText("BGP",  2, 12)
+    ctx.fillText("OBP0", 2, 12 + sh)
+    ctx.fillText("OBP1", 2, 12 + sh * 2)
+
+    fn drawPalRow(y, pal)
+      :* (let i = 0; i < 4; i++)
+        c := (pal >> (i * 2)) & 0x03
+        shade := 0
+        :~ c
+          :! 0 
+			shade = 255
+          :! 1 
+			shade = 192
+          :! 2 
+			shade = 96
+          :! 3 
+			shade = 0
+        :e
+        x := 40 + i * sw
+        ctx.fillStyle = "rgb(" + shade + "," + shade + "," + shade + ")"
+        ctx.fillRect(x, y, sw, sh)
+      :e
+    end
+
+    drawPalRow(0,      bgp)
+    drawPalRow(sh,     obp0)
+    drawPalRow(sh * 2, obp1)
+  :e
+
+
+
+  :m tickPpu(cycles)
+    mem := :@mem
+    ly  := :@ppuLY
+    acc := :@ppuScanlineCycles
+
+    acc = (acc + cycles) | 0
+
+    // 1 scanline ≈ 456 cycles
+    :w (acc >= 456)
+      acc = acc - 456
+
+      ly = (ly + 1) & 0xFF
+      if (ly >= 154)
+        ly = 0
+      :e
+
+      // อัปเดต LY register ให้ CPU อ่านได้
+      mem.wb(0xFF44, ly)
+
+      // เข้า VBlank ช่วง LY = 144..153
+      if (ly == 144)
+        curIF := mem.rb(0xFF0F)
+        mem.wb(0xFF0F, curIF | 0x01)   // set VBlank bit
+      :e
+    :e
+
+    :@ppuScanlineCycles = acc
+    :@ppuLY = ly
+  :e
+
+
+  :m loadRomFromArrayBuffer(buf)
+    rom := :N Uint8Array(buf)
+
+    // reset RAM + IO, แล้วค่อยโหลด ROM + reset CPU/PPU
+    :@mem.reset()
+    :@mem.loadRom(rom)
+    :@cpu.reset()
+    :@ppu.reset()
+
+    // debug: log header บางส่วนให้เช็คว่า ROM โหลดจริง
+    if (typeof console !== "undefined" && console && console.log)
+      t0 := :@mem.rb(0x0104)
+      t1 := :@mem.rb(0x0105)
+      t2 := :@mem.rb(0x0106)
+      t3 := :@mem.rb(0x0107)
+      console.log("ROM header @0104:", t0, t1, t2, t3)
+    :e
+  :e
+
+  :m loadRomFromUrl(url)
+    // Fetch ROM (.gb) แล้วโหลดเข้า memory
+    :^ fetch(url)
+      .then((res) => res.arrayBuffer())
+      .then((buf) => {
+        :@loadRomFromArrayBuffer(buf)
+        :^ this
+      })
+  :e
+
+  :m start()
+    if (!:@renderer || !:@renderer.gl) -> :^
+
+    :@running = :)
+    :@lastTime = performance.now()
+    requestAnimationFrame(:@boundFrameLoop)
+  :e
+
+
+
+
+
+  :m stop()
+    :@running = :(
+  :e
+  
+  :m pause()
+    :@running = :(
+  :e
+  
+  :m resume()
+    :@running = :)
+  :e
+
+  :m debugRenderTestOnce()
+    // หยุด loop ก่อนกันโดนทับ
+    :@running = :(
+    :@ppu.renderTestPattern()
+    :@renderer.draw(:@ppu.frameBuffer)
+  :e
+
+
+
+    :m frameLoop(now)
+    if (!:@running) -> :^
+
+    dtMs := now - :@lastTime
+    if (dtMs < 0) dtMs = 0
+    :@lastTime = now
+    if (dtMs > 50) dtMs = 50
+
+    cyclesPerMs := GB_CPU_HZ / 1000
+    target := (dtMs * cyclesPerMs) | 0
+    if (target < 0) target = 0
+
+    :@runCpu(target)
+
+    // วาด BG จาก VRAM → framebuffer → WebGL
+    :@ppu.renderBG()
+    :@renderer.draw(:@ppu.frameBuffer)
+
+    requestAnimationFrame(:@boundFrameLoop)
+  :e
+
+
+
+  :m runCpu(totalCycles)
+    spent := 0
+    :w (spent < totalCycles)
+      step := :@cpu.step(totalCycles - spent)
+      if (!step)
+        :/
+      :e
+
+      :@tickPpu(step)
+
+      spent += step
+    :e
+  :e
+
+:e
+
+fn createGbEmu(canvasId)
+  emu := :N GBEmu(canvasId)
+  :^ emu
+:e
+
+// Export to window (plain JS assignment เพื่อไม่ไปชน sugar)
+if (typeof window !== "undefined")
+  window.GBEmu = GBEmu
+  window.createGbEmu = createGbEmu
+end

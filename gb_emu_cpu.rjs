@@ -1,0 +1,1626 @@
+/*!
+ * RJS - Revolution JavaScript
+ * © Peacedeveloper. All rights reserved.
+ * https://peacedeveloper1.github.io/rjs/
+ * peacedeveloper@gmail.com
+ * This file is part of the RJS language and loader.
+ * Unauthorized copying, modification, or distribution is prohibited.
+ */
+:c GBCPU
+  :n (mem, ppu)
+    :@mem := mem
+    :@ppu := ppu
+
+    // limit log spam
+    :@warnCount := 0
+    :@warnLimit := 1000   // ปรับได้ตามใจ แต่ไม่ควรเยอะเกิน
+
+    :@reset()
+  :e
+
+
+  :m reset()
+    // DMG post-BIOS state (เริ่มที่ 0x0100)
+    :@pc = 0x0100
+    :@sp = 0xFFFE
+    :@a  = 0x01
+    :@f  = 0xB0
+    :@b  = 0x00
+    :@c  = 0x13
+    :@d  = 0x00
+    :@e  = 0xD8
+    :@h  = 0x01
+    :@l  = 0x4D
+
+    :@ime    = :(   // interrupt master enable
+    :@halted = :(
+
+    // reset warning counter
+    :@warnCount = 0
+  :e
+
+
+  // --- memory helpers ----------------------------------------------
+  :m rb(addr)
+    :^ :@mem.rb(addr)
+  :e
+
+  :m wb(addr, v)
+    :@mem.wb(addr, v)
+  :e
+
+  :m readImm8()
+    v := :@rb(:@pc)
+    :@pc = (:@pc + 1) & 0xFFFF
+    :^ v
+  :e
+
+  :m readImm16()
+    lo := :@readImm8()
+    hi := :@readImm8()
+    :^ lo | (hi << 8)
+  :e
+
+  :m push16(val)
+    :@sp = (:@sp - 1) & 0xFFFF
+    :@wb(:@sp, (val >> 8) & 0xFF)
+    :@sp = (:@sp - 1) & 0xFFFF
+    :@wb(:@sp, val & 0xFF)
+  :e
+
+  :m pop16()
+    lo := :@rb(:@sp)
+    :@sp = (:@sp + 1) & 0xFFFF
+    hi := :@rb(:@sp)
+    :@sp = (:@sp + 1) & 0xFFFF
+    :^ lo | (hi << 8)
+  :e
+
+  // --- 8-bit reg helpers: index = B,C,D,E,H,L,(HL),A ---------------
+  :m getReg(index)
+    :~ index
+      :! 0
+        :^ :@b
+      :! 1
+        :^ :@c
+      :! 2
+        :^ :@d
+      :! 3
+        :^ :@e
+      :! 4
+        :^ :@h
+      :! 5
+        :^ :@l
+      :! 6
+        addr := ((:@h << 8) | :@l) & 0xFFFF
+        :^ :@rb(addr)
+      :! 7
+        :^ :@a
+      :_
+        :^ 0
+    :e
+  :e
+
+  :m setReg(index, val)
+    v := val & 0xFF
+    :~ index
+      :! 0
+        :@b = v
+        :/
+      :! 1
+        :@c = v
+        :/
+      :! 2
+        :@d = v
+        :/
+      :! 3
+        :@e = v
+        :/
+      :! 4
+        :@h = v
+        :/
+      :! 5
+        :@l = v
+        :/
+      :! 6
+        addr := ((:@h << 8) | :@l) & 0xFFFF
+        :@wb(addr, v)
+        :/
+      :! 7
+        :@a = v
+        :/
+      :_
+        // ignore
+    :e
+  :e
+  
+  // --- 8-bit ALU helper for A op -------------------------------
+  // opId: 0=ADD,1=ADC,2=SUB,3=SBC,4=AND,5=XOR,6=OR,7=CP
+  :m alu8(opId, value)
+    a := :@a & 0xFF
+    v := value & 0xFF
+    carryIn := ((:@f & 0x10) != 0) ? 1 : 0
+    res := 0
+    f := 0
+	sum := 0
+
+    :~ opId
+      :! 0   // ADD A,v
+        sum = a + v
+        res = sum & 0xFF
+        if (res == 0) f |= 0x80     // Z
+        // N = 0
+        if (((a & 0x0F) + (v & 0x0F)) > 0x0F) f |= 0x20   // H
+        if (sum > 0xFF) f |= 0x10                         // C
+        :@a = res
+        :/
+      :! 1   // ADC A,v
+        sum = a + v + carryIn
+        res = sum & 0xFF
+        if (res == 0) f |= 0x80
+        if (((a & 0x0F) + (v & 0x0F) + carryIn) > 0x0F) f |= 0x20
+        if (sum > 0xFF) f |= 0x10
+        :@a = res
+        :/
+      :! 2   // SUB v
+        diff1 := a - v
+        res = diff1 & 0xFF
+        f |= 0x40                   // N=1
+        if (res == 0) f |= 0x80
+        if ((a & 0x0F) < (v & 0x0F)) f |= 0x20
+        if (a < v) f |= 0x10
+        :@a = res
+        :/
+      :! 3   // SBC A,v
+        subVal := v + carryIn
+        diff2 := a - subVal
+        res = diff2 & 0xFF
+        f |= 0x40
+        if (res == 0) f |= 0x80
+        if ((a & 0x0F) < ((v & 0x0F) + carryIn)) f |= 0x20
+        if (a < subVal) f |= 0x10
+        :@a = res
+        :/
+      :! 4   // AND v
+        res = a & v
+        if (res == 0) f |= 0x80
+        f |= 0x20           // H=1, N=0, C=0
+        :@a = res
+        :/
+      :! 5   // XOR v
+        res = a ^ v
+        if (res == 0) f |= 0x80
+        :@a = res
+        :/
+      :! 6   // OR v
+        res = a | v
+        if (res == 0) f |= 0x80
+        :@a = res
+        :/
+      :! 7   // CP v (A ไม่เปลี่ยน)
+        diff := a - v
+        res = diff & 0xFF
+        f |= 0x40              // N=1
+        if (res == 0) f |= 0x80
+        if ((a & 0x0F) < (v & 0x0F)) f |= 0x20
+        if (a < v) f |= 0x10
+        :/
+      :_
+    :e
+
+    :@f = f
+  :e
+  
+
+
+    // --- main step ---------------------------------------------------
+  :m step(budgetCycles)
+    // --- interrupt check ก่อน fetch op ---
+    ie := :@rb(0xFFFF)
+    iff := :@rb(0xFF0F)
+    pending := ie & iff & 0x1F    // bit 0..4 = VBLANK,STAT,TIMA,SERIAL,JOYPAD
+
+    if (pending != 0)
+      // ถ้า HALT อยู่ ให้ปลุกก่อน
+      if (:@halted)
+        :@halted = :(
+      :e
+
+      if (:@ime)
+        // หา highest-priority interrupt 0..4
+        idxInt := -1
+        :* (let i = 0; i < 5; i++)
+          if ((pending & (1 << i)) != 0 && idxInt < 0)
+            idxInt = i
+          :e
+        :e
+
+        if (idxInt >= 0)
+          // clear IF bit ที่ยิงไปแล้ว
+          newIF := iff & (~(1 << idxInt) & 0xFF)
+          :@wb(0xFF0F, newIF)
+
+          // IME off ระหว่าง service
+          :@ime = :(
+
+          // push PC แล้วกระโดดไป vector
+          :@push16(:@pc)
+
+          :~ idxInt
+            :! 0   // VBlank
+              :@pc = 0x40
+              :/
+            :! 1   // LCD STAT
+              :@pc = 0x48
+              :/
+            :! 2   // Timer
+              :@pc = 0x50
+              :/
+            :! 3   // Serial
+              :@pc = 0x58
+              :/
+            :! 4   // Joypad
+              :@pc = 0x60
+              :/
+            :_
+          :e
+
+          // interrupt กิน 20 cycles
+          :^ 20
+        :e
+      :e
+    :e
+
+    // ถ้ายัง HALT และไม่มี interrupt ให้กินไปแค่ 4 cycles
+    if (:@halted)
+      :^ 4
+    :e
+
+
+    pcBefore := :@pc
+    op := :@readImm8()
+
+        // locals (ประกาศทีเดียวกัน switch let ซ้ำ)
+    cycles := 4
+    v8     := 0
+    v16    := 0
+    addr   := 0
+    disp   := 0
+    cond   := :(
+    src    := 0
+    dst    := 0
+    handled := :(
+    cb     := 0
+    tmp    := 0
+    tmp2   := 0
+    f      := 0
+    bit    := 0
+    carry  := 0
+    group  := 0
+    oldCarry := 0
+    mask   := 0
+	hl	:= 0
+	ss := 0
+	sum16 := 0
+	carry16 := 0
+	half := 0
+
+    // prefix CB: bit ops / shifts / rotates
+    if (op == 0xCB)
+      cb = :@readImm8()
+      src = cb & 0x07             // 0..7 = B,C,D,E,H,L,(HL),A
+      group = (cb >> 3) & 0x1F    // 0..31
+
+      // --- rotate / shift / swap: groups 0..7 ---------------------
+      if (group < 8)
+        v8 = :@getReg(src)
+        tmp = v8
+        f = 0
+        carry = 0
+        oldCarry = 0
+
+        :~ group
+          :! 0   // RLC r
+            carry = (tmp >> 7) & 1
+            v8 = ((tmp << 1) & 0xFF) | carry
+            f = 0
+            if (v8 == 0) f |= 0x80        // Z
+            if (carry != 0) f |= 0x10    // C
+            :/
+          :! 1   // RRC r
+            carry = tmp & 1
+            v8 = (tmp >> 1) & 0x7F
+            if (carry != 0) v8 |= 0x80
+            f = 0
+            if (v8 == 0) f |= 0x80
+            if (carry != 0) f |= 0x10
+            :/
+          :! 2   // RL r (through carry)
+            oldCarry = ((:@f & 0x10) != 0) ? 1 : 0
+            carry = (tmp >> 7) & 1
+            v8 = ((tmp << 1) & 0xFF) | oldCarry
+            f = 0
+            if (v8 == 0) f |= 0x80
+            if (carry != 0) f |= 0x10
+            :/
+          :! 3   // RR r (through carry)
+            oldCarry = ((:@f & 0x10) != 0) ? 1 : 0
+            carry = tmp & 1
+            v8 = (tmp >> 1) & 0x7F
+            if (oldCarry != 0) v8 |= 0x80
+            f = 0
+            if (v8 == 0) f |= 0x80
+            if (carry != 0) f |= 0x10
+            :/
+          :! 4   // SLA r
+            carry = (tmp >> 7) & 1
+            v8 = (tmp << 1) & 0xFF
+            f = 0
+            if (v8 == 0) f |= 0x80
+            if (carry != 0) f |= 0x10
+            :/
+          :! 5   // SRA r
+            carry = tmp & 1
+            v8 = (tmp >> 1) & 0x7F
+            if ((tmp & 0x80) != 0) v8 |= 0x80   // keep sign bit
+            f = 0
+            if (v8 == 0) f |= 0x80
+            if (carry != 0) f |= 0x10
+            :/
+          :! 6   // SWAP r
+            v8 = ((tmp & 0x0F) << 4) | ((tmp >> 4) & 0x0F)
+            f = 0
+            if (v8 == 0) f |= 0x80    // C=0, N=0, H=0
+            :/
+          :! 7   // SRL r
+            carry = tmp & 1
+            v8 = (tmp >> 1) & 0x7F
+            f = 0
+            if (v8 == 0) f |= 0x80
+            if (carry != 0) f |= 0x10
+            :/
+          :_
+            // shouldn't happen
+        :e
+
+        :@setReg(src, v8)
+        :@f = f
+
+        if (src == 6)
+          :^ 16       // (HL) = 16 cycles
+        :e
+        :^ 8          // register = 8 cycles
+      :e
+
+      // --- BIT b,r: groups 8..15 ----------------------------------
+      if (group >= 8 && group < 16)
+        bit = group - 8
+        v8 = :@getReg(src)
+        mask := (1 << bit)
+
+        f = :@f
+        f = (f & 0x10) | 0x20   // keep C, set H=1, N=0
+        if ((v8 & mask) == 0) f |= 0x80
+        :@f = f
+
+        if (src == 6)
+          :^ 12
+        :e
+        :^ 8
+      :e
+
+      // --- RES b,r: groups 16..23 ---------------------------------
+      if (group >= 16 && group < 24)
+        bit = group - 16
+        v8 = :@getReg(src)
+        mask := ~(1 << bit) & 0xFF
+        v8 = v8 & mask
+        :@setReg(src, v8)
+
+        if (src == 6)
+          :^ 16
+        :e
+        :^ 8
+      :e
+
+      // --- SET b,r: groups 24..31 ---------------------------------
+      bit = group - 24
+      v8 = :@getReg(src)
+      mask := (1 << bit) & 0xFF
+      v8 = v8 | mask
+      :@setReg(src, v8)
+
+      if (src == 6)
+        :^ 16
+      :e
+      :^ 8
+    :e
+
+
+    :~ op
+      // --- NOP -----------------------------------------------------
+      :! 0x00
+        cycles = 4
+        handled = :)
+        :/
+		
+	      // --- rotate A / flag ops / STOP -----------------------------
+
+      :! 0x07   // RLCA
+        tmp = :@a & 0xFF
+        carry = (tmp >> 7) & 1
+        v8 = ((tmp << 1) & 0xFF) | carry
+        :@a = v8
+        :@f = 0
+        if (carry != 0) :@f |= 0x10    // C
+        cycles = 4
+        handled = :)
+        :/
+
+      :! 0x0F   // RRCA
+        tmp = :@a & 0xFF
+        carry = tmp & 1
+        v8 = (tmp >> 1) & 0x7F
+        if (carry != 0) v8 |= 0x80
+        :@a = v8
+        :@f = 0
+        if (carry != 0) :@f |= 0x10
+        cycles = 4
+        handled = :)
+        :/
+
+      :! 0x17   // RLA
+        tmp = :@a & 0xFF
+        oldCarry = ((:@f & 0x10) != 0) ? 1 : 0
+        carry = (tmp >> 7) & 1
+        v8 = ((tmp << 1) & 0xFF) | oldCarry
+        :@a = v8
+        :@f = 0
+        if (carry != 0) :@f |= 0x10
+        cycles = 4
+        handled = :)
+        :/
+
+      :! 0x1F   // RRA
+        tmp = :@a & 0xFF
+        oldCarry = ((:@f & 0x10) != 0) ? 1 : 0
+        carry = tmp & 1
+        v8 = (tmp >> 1) & 0x7F
+        if (oldCarry != 0) v8 |= 0x80
+        :@a = v8
+        :@f = 0
+        if (carry != 0) :@f |= 0x10
+        cycles = 4
+        handled = :)
+        :/
+
+      :! 0x27   // DAA
+        a = :@a & 0xFF
+        fOld := :@f
+        adj := 0
+        carry = ((fOld & 0x10) != 0) ? 1 : 0
+
+        if ((fOld & 0x40) == 0)
+          // หลัง ADD
+          if ((fOld & 0x20) != 0 || (a & 0x0F) > 0x09)
+            adj += 0x06
+          :e
+          if (carry != 0 || a > 0x99)
+            adj += 0x60
+            carry = 1
+          :e
+          a = (a + adj) & 0xFF
+        :e
+        if ((fOld & 0x40) != 0)
+          // หลัง SUB
+          if ((fOld & 0x20) != 0)
+            adj += 0x06
+          :e
+          if (carry != 0)
+            adj += 0x60
+          :e
+          a = (a - adj) & 0xFF
+        :e
+
+        :@a = a
+        fNew := 0
+        if (a == 0) fNew |= 0x80        // Z
+        if ((fOld & 0x40) != 0) fNew |= 0x40  // N
+        if (carry != 0) fNew |= 0x10          // C
+        :@f = fNew       // H ถูกเคลียร์ (0x20)
+        cycles = 4
+        handled = :)
+        :/
+
+      :! 0x2F   // CPL
+        :@a = (~:@a) & 0xFF
+        :@f |= 0x60    // N=1,H=1; Z,C คงเดิม
+        cycles = 4
+        handled = :)
+        :/
+
+      :! 0x37   // SCF
+        // Z คงเดิม, C=1, N/H=0
+        z = :@f & 0x80
+        :@f = z | 0x10
+        cycles = 4
+        handled = :)
+        :/
+
+      :! 0x3F   // CCF
+        oldC = ((:@f & 0x10) != 0) ? 1 : 0
+        z = :@f & 0x80
+        newC = (oldC == 0) ? 0x10 : 0
+        :@f = z | newC   // N,H = 0
+        cycles = 4
+        handled = :)
+        :/
+
+      :! 0x10   // STOP
+        // treat STOP เป็น 2-byte NOP: อ่าน padding ทิ้งไป
+        :@readImm8()
+        cycles = 4
+        handled = :)
+        :/
+
+
+      // --- 16-bit LD immediate ------------------------------------
+      :! 0x01   // LD BC,d16
+        v16 = :@readImm16()
+        :@b = (v16 >> 8) & 0xFF
+        :@c = v16 & 0xFF
+        cycles = 12
+        handled = :)
+        :/
+
+      :! 0x11   // LD DE,d16
+        v16 = :@readImm16()
+        :@d = (v16 >> 8) & 0xFF
+        :@e = v16 & 0xFF
+        cycles = 12
+        handled = :)
+        :/
+
+      :! 0x21   // LD HL,d16
+        v16 = :@readImm16()
+        :@h = (v16 >> 8) & 0xFF
+        :@l = v16 & 0xFF
+        cycles = 12
+        handled = :)
+        :/
+
+      :! 0x31   // LD SP,d16
+        :@sp = :@readImm16()
+        cycles = 12
+        handled = :)
+        :/
+
+		      :! 0xF9   // LD SP,HL
+        :@sp = ((:@h << 8) | :@l) & 0xFFFF
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0xE8   // ADD SP,r8
+        v8 = :@readImm8()
+        disp = v8
+        if (disp >= 128) disp = disp - 256   // signed r8
+        tmp = :@sp + disp
+
+        :@f = 0
+        if (((:@sp ^ disp ^ tmp) & 0x10) != 0) :@f |= 0x20   // H
+        if (((:@sp ^ disp ^ tmp) & 0x100) != 0) :@f |= 0x10  // C
+
+        :@sp = tmp & 0xFFFF
+        cycles = 16
+        handled = :)
+        :/
+
+      :! 0xF8   // LD HL,SP+r8
+        v8 = :@readImm8()
+        disp = v8
+        if (disp >= 128) disp = disp - 256
+        tmp = :@sp + disp
+
+        :@f = 0
+        if (((:@sp ^ disp ^ tmp) & 0x10) != 0) :@f |= 0x20   // H
+        if (((:@sp ^ disp ^ tmp) & 0x100) != 0) :@f |= 0x10  // C
+
+        :@h = (tmp >> 8) & 0xFF
+        :@l = tmp & 0xFF
+        cycles = 12
+        handled = :)
+        :/
+
+      // --- 16-bit INC ---------------------------------------------
+      :! 0x03   // INC BC
+        v16 = (((:@b << 8) | :@c) + 1) & 0xFFFF
+        :@b = (v16 >> 8) & 0xFF
+        :@c = v16 & 0xFF
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0x13   // INC DE
+        v16 = (((:@d << 8) | :@e) + 1) & 0xFFFF
+        :@d = (v16 >> 8) & 0xFF
+        :@e = v16 & 0xFF
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0x23   // INC HL
+        v16 = (((:@h << 8) | :@l) + 1) & 0xFFFF
+        :@h = (v16 >> 8) & 0xFF
+        :@l = v16 & 0xFF
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0x33   // INC SP
+        :@sp = (:@sp + 1) & 0xFFFF
+        cycles = 8
+        handled = :)
+        :/
+
+	      // --- 16-bit DEC ---------------------------------------------
+      :! 0x0B   // DEC BC
+        v16 = (((:@b << 8) | :@c) - 1) & 0xFFFF
+        :@b = (v16 >> 8) & 0xFF
+        :@c = v16 & 0xFF
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0x1B   // DEC DE
+        v16 = (((:@d << 8) | :@e) - 1) & 0xFFFF
+        :@d = (v16 >> 8) & 0xFF
+        :@e = v16 & 0xFF
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0x2B   // DEC HL
+        v16 = (((:@h << 8) | :@l) - 1) & 0xFFFF
+        :@h = (v16 >> 8) & 0xFF
+        :@l = v16 & 0xFF
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0x3B   // DEC SP
+        :@sp = (:@sp - 1) & 0xFFFF
+        cycles = 8
+        handled = :)
+        :/
+
+      // --- 16-bit ADD HL,ss (0x09,0x19,0x29,0x39) -----------------
+	  // --- 16-bit ADD HL,ss ---------------------------------------
+      :! 0x09   // ADD HL,BC
+        hl = ((:@h << 8) | :@l) & 0xFFFF
+        ss = ((:@b << 8) | :@c) & 0xFFFF
+        sum16 = hl + ss
+        carry16 = (sum16 > 0xFFFF) ? 1 : 0
+        half = (((hl & 0x0FFF) + (ss & 0x0FFF)) > 0x0FFF) ? 1 : 0
+        hl = sum16 & 0xFFFF
+        :@h = (hl >> 8) & 0xFF
+        :@l = hl & 0xFF
+        f = :@f & 0x80      // keep Z
+        if (half != 0) f |= 0x20
+        if (carry16 != 0) f |= 0x10
+        :@f = f
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0x19   // ADD HL,DE
+        hl = ((:@h << 8) | :@l) & 0xFFFF
+        ss = ((:@d << 8) | :@e) & 0xFFFF
+        sum16 = hl + ss
+        carry16 = (sum16 > 0xFFFF) ? 1 : 0
+        half = (((hl & 0x0FFF) + (ss & 0x0FFF)) > 0x0FFF) ? 1 : 0
+        hl = sum16 & 0xFFFF
+        :@h = (hl >> 8) & 0xFF
+        :@l = hl & 0xFF
+        f = :@f & 0x80
+        if (half != 0) f |= 0x20
+        if (carry16 != 0) f |= 0x10
+        :@f = f
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0x29   // ADD HL,HL
+        hl = ((:@h << 8) | :@l) & 0xFFFF
+        ss = hl
+        sum16 = hl + ss
+        carry16 = (sum16 > 0xFFFF) ? 1 : 0
+        half = (((hl & 0x0FFF) + (ss & 0x0FFF)) > 0x0FFF) ? 1 : 0
+        hl = sum16 & 0xFFFF
+        :@h = (hl >> 8) & 0xFF
+        :@l = hl & 0xFF
+        f = :@f & 0x80
+        if (half != 0) f |= 0x20
+        if (carry16 != 0) f |= 0x10
+        :@f = f
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0x39   // ADD HL,SP
+        hl = ((:@h << 8) | :@l) & 0xFFFF
+        ss = :@sp & 0xFFFF
+        sum16 = hl + ss
+        carry16 = (sum16 > 0xFFFF) ? 1 : 0
+        half = (((hl & 0x0FFF) + (ss & 0x0FFF)) > 0x0FFF) ? 1 : 0
+        hl = sum16 & 0xFFFF
+        :@h = (hl >> 8) & 0xFF
+        :@l = hl & 0xFF
+        f = :@f & 0x80
+        if (half != 0) f |= 0x20
+        if (carry16 != 0) f |= 0x10
+        :@f = f
+        cycles = 8
+        handled = :)
+        :/
+		
+	      // --- SP relative ops ----------------------------------------
+
+      :! 0xE8   // ADD SP,r8
+        v8 = :@readImm8()
+        disp = v8
+        if (disp >= 128) disp = disp - 256   // sign extend
+        spVal = :@sp & 0xFFFF
+        sum16 = (spVal + disp) & 0xFFFF
+
+        // flags: Z=0, N=0, H/C จาก low byte
+        f = 0
+        if (((spVal & 0x0F) + (disp & 0x0F)) > 0x0F) f |= 0x20
+        if (((spVal & 0xFF) + (disp & 0xFF)) > 0xFF) f |= 0x10
+        :@f = f
+
+        :@sp = sum16
+        cycles = 16
+        handled = :)
+        :/
+
+      :! 0xF8   // LD HL,SP+r8
+        v8 = :@readImm8()
+        disp = v8
+        if (disp >= 128) disp = disp - 256
+        spVal = :@sp & 0xFFFF
+        sum16 = (spVal + disp) & 0xFFFF
+
+        :@h = (sum16 >> 8) & 0xFF
+        :@l = sum16 & 0xFF
+
+        f = 0
+        if (((spVal & 0x0F) + (disp & 0x0F)) > 0x0F) f |= 0x20
+        if (((spVal & 0xFF) + (disp & 0xFF)) > 0xFF) f |= 0x10
+        :@f = f
+
+        cycles = 12
+        handled = :)
+        :/
+
+      :! 0xF9   // LD SP,HL
+        :@sp = ((:@h << 8) | :@l) & 0xFFFF
+        // flags ไม่เปลี่ยน
+        cycles = 8
+        handled = :)
+        :/
+
+		      // --- illegal / unused opcodes, treat as NOP -----------------
+      :! 0xD3   // illegal
+        cycles = 4
+        handled = :)
+        :/
+      :! 0xDB   // illegal
+        cycles = 4
+        handled = :)
+        :/
+      :! 0xDD   // illegal
+        cycles = 4
+        handled = :)
+        :/
+      :! 0xE3   // illegal
+        cycles = 4
+        handled = :)
+        :/
+      :! 0xE4   // illegal
+        cycles = 4
+        handled = :)
+        :/
+      :! 0xEB   // illegal
+        cycles = 4
+        handled = :)
+        :/
+      :! 0xEC   // illegal
+        cycles = 4
+        handled = :)
+        :/
+      :! 0xED   // illegal
+        cycles = 4
+        handled = :)
+        :/
+      :! 0xF4   // illegal
+        cycles = 4
+        handled = :)
+        :/
+      :! 0xFC   // illegal
+        cycles = 4
+        handled = :)
+        :/
+      :! 0xFD   // illegal
+        cycles = 4
+        handled = :)
+        :/
+
+		
+    if (!handled && ((op & 0xCF) == 0x09))
+      // ss: 0=BC, 1=DE, 2=HL, 3=SP
+      src = (op >> 4) & 0x03
+
+      v16 = ((:@h << 8) | :@l) & 0xFFFF   // HL ปัจจุบัน
+
+      // เลือก source 16-bit
+      :~ src
+        :! 0   // BC
+          tmp = ((:@b << 8) | :@c) & 0xFFFF
+          :/
+        :! 1   // DE
+          tmp = ((:@d << 8) | :@e) & 0xFFFF
+          :/
+        :! 2   // HL
+          tmp = v16
+          :/
+        :! 3   // SP
+          tmp = :@sp
+          :/
+        :_
+      :e
+
+      tmp2 = v16 + tmp
+
+      // flags: N=0, Z ไม่เปลี่ยน, H/C จากผลบวก 16-bit
+      f = :@f & 0x80       // keep Z เดิม
+      if (((v16 & 0x0FFF) + (tmp & 0x0FFF)) > 0x0FFF) f |= 0x20   // H
+      if (tmp2 > 0xFFFF) f |= 0x10                                // C
+      :@f = f
+
+      v16 = tmp2 & 0xFFFF
+      :@h = (v16 >> 8) & 0xFF
+      :@l = v16 & 0xFF
+
+      cycles = 8
+      handled = :)
+    :e
+
+
+      // --- 8-bit immediate loads ----------------------------------
+      :! 0x06   // LD B,d8
+        :@b = :@readImm8()
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0x0E   // LD C,d8
+        :@c = :@readImm8()
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0x16   // LD D,d8
+        :@d = :@readImm8()
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0x1E   // LD E,d8
+        :@e = :@readImm8()
+        cycles = 8
+        handled = :)
+        :/
+
+            :! 0x26   // LD H,d8
+        :@h = :@readImm8()
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0x2E   // LD L,d8
+        :@l = :@readImm8()
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0x36   // LD (HL),d8
+        v8 = :@readImm8()
+        addr = ((:@h << 8) | :@l) & 0xFFFF
+        :@wb(addr, v8)
+        cycles = 12
+        handled = :)
+        :/
+
+      :! 0x3E   // LD A,d8
+        :@a = :@readImm8()
+        cycles = 8
+        handled = :)
+        :/
+
+
+      // --- 8-bit LD with memory -----------------------------------
+      :! 0x02   // LD (BC),A
+        addr = ((:@b << 8) | :@c) & 0xFFFF
+        :@wb(addr, :@a)
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0x12   // LD (DE),A
+        addr = ((:@d << 8) | :@e) & 0xFFFF
+        :@wb(addr, :@a)
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0x0A   // LD A,(BC)
+        addr = ((:@b << 8) | :@c) & 0xFFFF
+        :@a = :@rb(addr)
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0x1A   // LD A,(DE)
+        addr = ((:@d << 8) | :@e) & 0xFFFF
+        :@a = :@rb(addr)
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0x22   // LD (HL+),A
+        addr = ((:@h << 8) | :@l) & 0xFFFF
+        :@wb(addr, :@a)
+        addr = (addr + 1) & 0xFFFF
+        :@h = (addr >> 8) & 0xFF
+        :@l = addr & 0xFF
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0x32   // LD (HL-),A
+        addr = ((:@h << 8) | :@l) & 0xFFFF
+        :@wb(addr, :@a)
+        addr = (addr - 1) & 0xFFFF
+        :@h = (addr >> 8) & 0xFF
+        :@l = addr & 0xFF
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0x2A   // LD A,(HL+)
+        addr = ((:@h << 8) | :@l) & 0xFFFF
+        :@a = :@rb(addr)
+        addr = (addr + 1) & 0xFFFF
+        :@h = (addr >> 8) & 0xFF
+        :@l = addr & 0xFF
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0x3A   // LD A,(HL-)
+        addr = ((:@h << 8) | :@l) & 0xFFFF
+        :@a = :@rb(addr)
+        addr = (addr - 1) & 0xFFFF
+        :@h = (addr >> 8) & 0xFF
+        :@l = addr & 0xFF
+        cycles = 8
+        handled = :)
+        :/
+
+      // --- LD (a16),SP --------------------------------------------
+      :! 0x08   // LD (a16),SP
+        addr = :@readImm16()
+        :@wb(addr, :@sp & 0xFF)
+        :@wb((addr + 1) & 0xFFFF, (:@sp >> 8) & 0xFF)
+        cycles = 20
+        handled = :)
+        :/
+
+      // --- I/O LDH / LD (a16) -------------------------------------
+      :! 0xE0   // LDH (a8),A
+        v8 = :@readImm8()
+        addr = 0xFF00 + v8
+        :@wb(addr, :@a)
+        cycles = 12
+        handled = :)
+        :/
+
+      :! 0xF0   // LDH A,(a8)
+        v8 = :@readImm8()
+        addr = 0xFF00 + v8
+        :@a = :@rb(addr)
+        cycles = 12
+        handled = :)
+        :/
+
+      :! 0xE2   // LD (C),A
+        addr = 0xFF00 + :@c
+        :@wb(addr, :@a)
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0xF2   // LD A,(C)
+        addr = 0xFF00 + :@c
+        :@a = :@rb(addr)
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0xEA   // LD (a16),A
+        addr = :@readImm16()
+        :@wb(addr, :@a)
+        cycles = 16
+        handled = :)
+        :/
+
+      :! 0xFA   // LD A,(a16)
+        addr = :@readImm16()
+        :@a = :@rb(addr)
+        cycles = 16
+        handled = :)
+        :/
+
+      // --- JR -----------------------------------------------------
+      :! 0x18   // JR r8
+        v8 = :@readImm8()
+        disp = v8
+        if (disp >= 128) disp = disp - 256
+        :@pc = (:@pc + disp) & 0xFFFF
+        cycles = 12
+        handled = :)
+        :/
+
+      :! 0x20   // JR NZ,r8
+        v8 = :@readImm8()
+        cond = ((:@f & 0x80) == 0)
+        if (cond)
+          disp = v8
+          if (disp >= 128) disp = disp - 256
+          :@pc = (:@pc + disp) & 0xFFFF
+          cycles = 12
+        :e
+        if (!cond) cycles = 8
+        handled = :)
+        :/
+
+      :! 0x28   // JR Z,r8
+        v8 = :@readImm8()
+        cond = ((:@f & 0x80) != 0)
+        if (cond)
+          disp = v8
+          if (disp >= 128) disp = disp - 256
+          :@pc = (:@pc + disp) & 0xFFFF
+          cycles = 12
+        :e
+        if (!cond) cycles = 8
+        handled = :)
+        :/
+
+      :! 0x30   // JR NC,r8
+        v8 = :@readImm8()
+        cond = ((:@f & 0x10) == 0)
+        if (cond)
+          disp = v8
+          if (disp >= 128) disp = disp - 256
+          :@pc = (:@pc + disp) & 0xFFFF
+          cycles = 12
+        :e
+        if (!cond) cycles = 8
+        handled = :)
+        :/
+
+      :! 0x38   // JR C,r8
+        v8 = :@readImm8()
+        cond = ((:@f & 0x10) != 0)
+        if (cond)
+          disp = v8
+          if (disp >= 128) disp = disp - 256
+          :@pc = (:@pc + disp) & 0xFFFF
+          cycles = 12
+        :e
+        if (!cond) cycles = 8
+        handled = :)
+        :/
+
+      // --- JP / CALL / RET ----------------------------------------
+      :! 0xC3   // JP a16
+        addr = :@readImm16()
+        :@pc = addr
+        cycles = 16
+        handled = :)
+        :/
+		
+		:! 0xC2   // JP NZ,a16
+        addr = :@readImm16()
+        cond = ((:@f & 0x80) == 0)
+        if (cond)
+          :@pc = addr
+          cycles = 16
+        :e
+        if (!cond) cycles = 12
+        handled = :)
+        :/
+
+      :! 0xCA   // JP Z,a16
+        addr = :@readImm16()
+        cond = ((:@f & 0x80) != 0)
+        if (cond)
+          :@pc = addr
+          cycles = 16
+        :e
+        if (!cond) cycles = 12
+        handled = :)
+        :/
+
+      :! 0xD2   // JP NC,a16
+        addr = :@readImm16()
+        cond = ((:@f & 0x10) == 0)
+        if (cond)
+          :@pc = addr
+          cycles = 16
+        :e
+        if (!cond) cycles = 12
+        handled = :)
+        :/
+
+      :! 0xDA   // JP C,a16
+        addr = :@readImm16()
+        cond = ((:@f & 0x10) != 0)
+        if (cond)
+          :@pc = addr
+          cycles = 16
+        :e
+        if (!cond) cycles = 12
+        handled = :)
+        :/
+
+      :! 0xE9   // JP (HL)
+        addr = ((:@h << 8) | :@l) & 0xFFFF
+        :@pc = addr
+        cycles = 4
+        handled = :)
+        :/
+
+      :! 0xCD   // CALL a16
+        addr = :@readImm16()
+        :@push16(:@pc)
+        :@pc = addr
+        cycles = 24
+        handled = :)
+        :/
+
+      :! 0xC9   // RET
+        :@pc = :@pop16()
+        cycles = 16
+        handled = :)
+        :/
+		
+	   :! 0xD9   // RETI
+        :@pc = :@pop16()
+        :@ime = :)     // เปิด IME คืนหลังออกจาก interrupt
+        cycles = 16
+        handled = :)
+        :/
+
+      // RET cc
+      :! 0xC0   // RET NZ
+        cond = ((:@f & 0x80) == 0)
+        if (cond)
+          :@pc = :@pop16()
+          cycles = 20
+        :e
+        if (!cond) cycles = 8
+        handled = :)
+        :/
+
+      :! 0xC8   // RET Z
+        cond = ((:@f & 0x80) != 0)
+        if (cond)
+          :@pc = :@pop16()
+          cycles = 20
+        :e
+        if (!cond) cycles = 8
+        handled = :)
+        :/
+
+      :! 0xD0   // RET NC
+        cond = ((:@f & 0x10) == 0)
+        if (cond)
+          :@pc = :@pop16()
+          cycles = 20
+        :e
+        if (!cond) cycles = 8
+        handled = :)
+        :/
+
+      :! 0xD8   // RET C
+        cond = ((:@f & 0x10) != 0)
+        if (cond)
+          :@pc = :@pop16()
+          cycles = 20
+        :e
+        if (!cond) cycles = 8
+        handled = :)
+        :/
+
+      // CALL cc
+      :! 0xC4   // CALL NZ,a16
+        addr = :@readImm16()
+        cond = ((:@f & 0x80) == 0)
+        if (cond)
+          :@push16(:@pc)
+          :@pc = addr
+          cycles = 24
+        :e
+        if (!cond) cycles = 12
+        handled = :)
+        :/
+
+      :! 0xCC   // CALL Z,a16
+        addr = :@readImm16()
+        cond = ((:@f & 0x80) != 0)
+        if (cond)
+          :@push16(:@pc)
+          :@pc = addr
+          cycles = 24
+        :e
+        if (!cond) cycles = 12
+        handled = :)
+        :/
+
+      :! 0xD4   // CALL NC,a16
+        addr = :@readImm16()
+        cond = ((:@f & 0x10) == 0)
+        if (cond)
+          :@push16(:@pc)
+          :@pc = addr
+          cycles = 24
+        :e
+        if (!cond) cycles = 12
+        handled = :)
+        :/
+
+      :! 0xDC   // CALL C,a16
+        addr = :@readImm16()
+        cond = ((:@f & 0x10) != 0)
+        if (cond)
+          :@push16(:@pc)
+          :@pc = addr
+          cycles = 24
+        :e
+        if (!cond) cycles = 12
+        handled = :)
+        :/
+		
+	      // --- RST vectors --------------------------------------------
+      :! 0xC7   // RST 00h
+        :@push16(:@pc)
+        :@pc = 0x00
+        cycles = 16
+        handled = :)
+        :/
+
+      :! 0xCF   // RST 08h
+        :@push16(:@pc)
+        :@pc = 0x08
+        cycles = 16
+        handled = :)
+        :/
+
+      :! 0xD7   // RST 10h
+        :@push16(:@pc)
+        :@pc = 0x10
+        cycles = 16
+        handled = :)
+        :/
+
+      :! 0xDF   // RST 18h
+        :@push16(:@pc)
+        :@pc = 0x18
+        cycles = 16
+        handled = :)
+        :/
+
+      :! 0xE7   // RST 20h
+        :@push16(:@pc)
+        :@pc = 0x20
+        cycles = 16
+        handled = :)
+        :/
+
+      :! 0xEF   // RST 28h
+        :@push16(:@pc)
+        :@pc = 0x28
+        cycles = 16
+        handled = :)
+        :/
+
+      :! 0xF7   // RST 30h
+        :@push16(:@pc)
+        :@pc = 0x30
+        cycles = 16
+        handled = :)
+        :/
+
+      :! 0xFF   // RST 38h
+        :@push16(:@pc)
+        :@pc = 0x38
+        cycles = 16
+        handled = :)
+        :/
+
+
+      // --- PUSH / POP ----------------------------------------------
+      :! 0xC5   // PUSH BC
+        v16 = ((:@b << 8) | :@c) & 0xFFFF
+        :@push16(v16)
+        cycles = 16
+        handled = :)
+        :/
+
+      :! 0xD5   // PUSH DE
+        v16 = ((:@d << 8) | :@e) & 0xFFFF
+        :@push16(v16)
+        cycles = 16
+        handled = :)
+        :/
+
+      :! 0xE5   // PUSH HL
+        v16 = ((:@h << 8) | :@l) & 0xFFFF
+        :@push16(v16)
+        cycles = 16
+        handled = :)
+        :/
+
+      :! 0xF5   // PUSH AF
+        v16 = ((:@a << 8) | (:@f & 0xF0)) & 0xFFFF
+        :@push16(v16)
+        cycles = 16
+        handled = :)
+        :/
+
+      :! 0xC1   // POP BC
+        v16 = :@pop16()
+        :@b = (v16 >> 8) & 0xFF
+        :@c = v16 & 0xFF
+        cycles = 12
+        handled = :)
+        :/
+
+      :! 0xD1   // POP DE
+        v16 = :@pop16()
+        :@d = (v16 >> 8) & 0xFF
+        :@e = v16 & 0xFF
+        cycles = 12
+        handled = :)
+        :/
+
+      :! 0xE1   // POP HL
+        v16 = :@pop16()
+        :@h = (v16 >> 8) & 0xFF
+        :@l = v16 & 0xFF
+        cycles = 12
+        handled = :)
+        :/
+
+      :! 0xF1   // POP AF
+        v16 = :@pop16()
+        :@a = (v16 >> 8) & 0xFF
+        :@f = v16 & 0xF0
+        cycles = 12
+        handled = :)
+        :/
+
+      // --- ALU immediate -------------------------------------------
+      :! 0xC6   // ADD A,d8
+        v8 = :@readImm8()
+        :@alu8(0, v8)
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0xCE   // ADC A,d8
+        v8 = :@readImm8()
+        :@alu8(1, v8)
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0xD6   // SUB d8
+        v8 = :@readImm8()
+        :@alu8(2, v8)
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0xDE   // SBC A,d8
+        v8 = :@readImm8()
+        :@alu8(3, v8)
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0xE6   // AND d8
+        v8 = :@readImm8()
+        :@alu8(4, v8)
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0xEE   // XOR d8
+        v8 = :@readImm8()
+        :@alu8(5, v8)
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0xF6   // OR d8
+        v8 = :@readImm8()
+        :@alu8(6, v8)
+        cycles = 8
+        handled = :)
+        :/
+
+      :! 0xFE   // CP d8
+        v8 = :@readImm8()
+        :@alu8(7, v8)
+        cycles = 8
+        handled = :)
+        :/
+
+      // --- simple ALU ที่ใช้บ่อย (XOR A) --------------------------
+      :! 0xAF   // XOR A
+        :@a = :@a ^ :@a
+        :@f = 0x80
+        cycles = 4
+        handled = :)
+        :/
+
+
+      // --- HALT ----------------------------------------------------
+      :! 0x76
+        :@halted = :)
+        cycles = 4
+        handled = :)
+        :/
+
+      // --- DI / EI -------------------------------------------------
+      :! 0xF3   // DI
+        :@ime = :(
+        cycles = 4
+        handled = :)
+        :/
+
+      :! 0xFB   // EI
+        :@ime = :)
+        cycles = 4
+        handled = :)
+        :/
+
+
+      // --- default: ไป generic group / NOP ------------------------
+      :_
+        handled = :(
+    :e   // end switch
+	
+    // ALU A,r group 0x80–0xBF
+    if (!handled && op >= 0x80 && op <= 0xBF)
+      src = op & 0x07                 // r
+      opGroup := (op >> 3) & 0x07     // 0..7 = ADD,ADC,SUB,SBC,AND,XOR,OR,CP
+
+      v8 = :@getReg(src)
+      :@alu8(opGroup, v8)
+
+      if (src == 6)
+        cycles = 8        // (HL)
+      else
+        cycles = 4        // register ปกติ
+      :e
+
+      handled = :)
+    :e
+
+
+    // --- generic groups: LD r,r' + INC/DEC r ----------------------
+    // LD r,r' group 0x40–0x7F (ยกเว้น HALT 0x76 จัดไปแล้ว)
+    if (!handled && op >= 0x40 && op <= 0x7F && op != 0x76)
+      dst = (op >> 3) & 0x07
+      src = op & 0x07
+      v8 = :@getReg(src)
+
+      :@setReg(dst, v8)
+      if (dst == 6 || src == 6)
+        cycles = 8
+      else
+        cycles = 4
+      :e
+      handled = :)
+    :e
+
+    // INC r group (0x04,0x0C,0x14,0x1C,0x24,0x2C,0x34,0x3C)
+    if (!handled && ((op & 0xC7) == 0x04))
+      dst = (op >> 3) & 0x07
+      v8 = :@getReg(dst)
+      tmp = v8
+      v8 = (v8 + 1) & 0xFF
+
+      :@f &= 0x10        // keep C
+      if (v8 == 0) :@f |= 0x80
+      if (((tmp & 0x0F) + 1) > 0x0F) :@f |= 0x20
+
+      :@setReg(dst, v8)
+      if (dst == 6)
+        cycles = 12
+      else
+        cycles = 4
+      :e
+      handled = :)
+    :e
+
+    // DEC r group (0x05,0x0D,0x15,0x1D,0x25,0x2D,0x35,0x3D)
+    if (!handled && ((op & 0xC7) == 0x05))
+      dst = (op >> 3) & 0x07
+      v8 = :@getReg(dst)
+      tmp = v8
+      v8 = (v8 - 1) & 0xFF
+
+      :@f &= 0x10        // keep C
+      :@f |= 0x40        // N = 1
+      if (v8 == 0) :@f |= 0x80
+      if ((tmp & 0x0F) == 0) :@f |= 0x20
+
+      :@setReg(dst, v8)
+      if (dst == 6)
+        cycles = 12
+      else
+        cycles = 4
+      :e
+      handled = :)
+    :e
+
+    // ถ้ายังไม่ handled → log แล้ว treat เป็น NOP
+    if (!handled)
+      // limit warning count กัน console spam + resource leak
+      if (:@warnCount < :@warnLimit)
+        if (typeof console !== "undefined" && console && console.warn)
+          console.warn(
+            "GBCPU: unimplemented opcode",
+            op.toString(16),
+            "at PC",
+            pcBefore.toString(16)
+          )
+        :e
+
+        :@warnCount++
+
+        // log ปิดท้ายรอบเดียว เมื่อถึง limit
+        if (:@warnCount == :@warnLimit)
+          if (typeof console !== "undefined" && console && console.warn)
+            console.warn("GBCPU: opcode warning limit reached, suppressing further messages")
+          :e
+        :e
+      :e
+
+      // อย่าหยุดเกม ให้เป็น NOP 4 cycles ไปก่อน
+      cycles = 4
+    :e
+
+
+    :^ cycles
+  :e
+
+:e
+
+export GBCPU
