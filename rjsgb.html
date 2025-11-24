@@ -26,8 +26,9 @@
 <script>
   let emu = null;
 
-  // โหลด CPU ก่อน แล้วค่อยโหลดตัว WebGL / Emulator
+  // โหลด CPU → APU → WebGL
   RJS.load("gb_emu_cpu.rjs")
+    .then(() => RJS.load("gb_emu_apu.rjs"))
     .then(() => RJS.load("gb_emu_webgl.rjs"))
     .then(() => {
       emu = createGbEmu("gb");
@@ -42,6 +43,7 @@
     .catch((err) => {
       console.error("GBEmu init error:", err);
     });
+
 
   // ปุ่ม Refresh VRAM / Palette เดิม
   document.getElementById("refreshDebug").addEventListener("click", () => {
@@ -75,15 +77,24 @@
 
       // loadRomFromArrayBuffer ใน GBEmu ใช้อยู่แล้ว
       _gb.loadRomFromArrayBuffer(buf);
+	  // ปลดล็อค AudioContext จาก user click
+      _gb.resumeAudio && _gb.resumeAudio();
       _gb.start && _gb.start();
     };
 
     reader.readAsArrayBuffer(file);
   });
   
+  
+  
+    const canvas = document.getElementById("gb");
+  canvas.addEventListener("click", () => {
+    if (window._gb && _gb.resumeAudio) _gb.resumeAudio();
+  });
+  
   /*!
  * © Peacedeveloper. All rights reserved.
- * https://peacedeveloper1.github.io/rjs/
+ * https://peacedeveloper1.github.io/
  * peacedeveloper@gmail.com
  * Unauthorized copying, modification, or distribution is prohibited.
  */

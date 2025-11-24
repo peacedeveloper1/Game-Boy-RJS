@@ -1,7 +1,7 @@
 // Game Boy WebGL Emulator Skeleton - RJS Full Compact
 /*!
  * © Peacedeveloper. All rights reserved.
- * https://peacedeveloper1.github.io/rjs/
+ * https://peacedeveloper1.github.io/
  * peacedeveloper@gmail.com
  * Unauthorized copying, modification, or distribution is prohibited.
  */
@@ -15,6 +15,7 @@ GB_CPU_HZ   :: 4194304
   :n ()
     :@bytes := :N Uint8Array(0x10000)
     :@joyp  := 0xFF
+	:@apu   := :$  
     
     // debug helper
     :@debugIO       := 0
@@ -27,6 +28,11 @@ GB_CPU_HZ   :: 4194304
   :m attachCpu(cpu)
     :@debugCpu = cpu
   :e
+
+  :m attachApu(apu)
+    :@apu = apu
+  :e
+
 
   :m reset()
     :@bytes.fill(0)
@@ -84,6 +90,12 @@ GB_CPU_HZ   :: 4194304
       :@joyp = (v & 0xF0) | 0x0F
       :@bytes[a] = :@joyp
       :^
+    :e
+	
+    // --- SOUND (FF10-FF3F) → ส่งต่อให้ APU ---
+    if (a >= 0xFF10 && a <= 0xFF3F && :@apu)
+      :@apu.writeReg(a, v)
+      // ตรงนี้ยังให้เขียนค่าเก็บใน bytes ปกติด้วย (ด้านล่าง)
     :e
 
     // --- IO debug trace ---
@@ -608,8 +620,13 @@ GB_CPU_HZ   :: 4194304
     :@ppu := :N GBPPU()
     :@ppu.attachMemory(:@mem)
     :@cpu := :N GBCPU(:@mem, :@ppu)
+
+    :@apu := :N GBAPU(:@mem)
     :@mem.attachCpu(:@cpu)
+    :@mem.attachApu(:@apu)
+
     :@renderer := :N GBWebGLRenderer(canvasId, GB_SCREEN_W, GB_SCREEN_H, GB_SCALE)
+
 
     // initial basic state (RAM/IO + PPU)
     :@mem.reset()
@@ -635,7 +652,7 @@ GB_CPU_HZ   :: 4194304
   :e
   
     // เติม tile ปลอม ๆ ลง VRAM 0x8000 เพื่อเทสต์ renderBG โดยไม่พึ่งเกม
-    :m debugFillTestTiles()
+  :m debugFillTestTiles()
     mem := :@mem
     tileBase := 0x8000
     tileCount := 256     // ยัด 256 tile แรกให้หมดไปเลย
@@ -808,6 +825,11 @@ GB_CPU_HZ   :: 4194304
   :e
 
 
+  :m tickApu(cycles)
+    if (:@apu)
+      :@apu.tick(cycles)
+    :e
+  :e
 
 
   // cycles = CPU cycles ที่เพิ่งใช้ไป
@@ -909,6 +931,9 @@ GB_CPU_HZ   :: 4194304
     :@mem.loadRom(rom)
     :@cpu.reset()
     :@ppu.reset()
+    if (:@apu)
+      :@apu.reset()
+    :e
 
     // debug: log header บางส่วนให้เช็คว่า ROM โหลดจริง
     if (typeof console !== "undefined" && console && console.log)
@@ -953,6 +978,13 @@ GB_CPU_HZ   :: 4194304
   :m resume()
     :@running = :)
   :e
+  
+  :m resumeAudio()
+    if (:@apu)
+      :@apu.resume()
+    :e
+  :e
+
 
   :m debugRenderTestOnce()
     // หยุด loop ก่อนกันโดนทับ
@@ -986,7 +1018,7 @@ GB_CPU_HZ   :: 4194304
 
 
 
-    :m runCpu(totalCycles)
+  :m runCpu(totalCycles)
     spent := 0
     :* ( ; spent < totalCycles; )
       step := :@cpu.step()
@@ -994,10 +1026,16 @@ GB_CPU_HZ   :: 4194304
 
       spent += step
 
-      // tick timer + PPU ทุก instruction
+      // tick timer + PPU + APU ทุก instruction
       :@tickTimers(step)
       :@tickPpu(step)
+      :@tickApu(step)
     :e
+
+    :@ppu.renderBG()
+    :@renderer.draw(:@ppu.frameBuffer)
+
+
 
         // วาดเฟรมหลังจบ CPU chunk
     :@ppu.renderBG()
