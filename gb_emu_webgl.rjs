@@ -1,14 +1,11 @@
 // Game Boy WebGL Emulator Skeleton - RJS Full Compact
 /*!
- * 
- * RJS - Revolution JavaScript
  * © Peacedeveloper. All rights reserved.
  * https://peacedeveloper1.github.io/rjs/
  * peacedeveloper@gmail.com
- * This file is part of the RJS language and loader.
  * Unauthorized copying, modification, or distribution is prohibited.
  */
-
+ 
 GB_SCREEN_W :: 160
 GB_SCREEN_H :: 144
 GB_SCALE    :: 4
@@ -17,57 +14,100 @@ GB_CPU_HZ   :: 4194304
 :c GBMemory
   :n ()
     :@bytes := :N Uint8Array(0x10000)
-
-    // debug VRAM write
-    :@debugVram       := :(
-    :@debugVramMax    := 200
-    :@debugVramCount  := 0
+    :@joyp  := 0xFF
+    
+    // debug helper
+    :@debugIO       := 0
+    :@debugIOCount  := 0
+    :@debugCpu      := :$ 
+    :@debugBG       := 0
+    :@debugBGCount  := 0
   :e
 
+  :m attachCpu(cpu)
+    :@debugCpu = cpu
+  :e
 
   :m reset()
     :@bytes.fill(0)
-
     b := :@bytes
-    // basic post-BIOS defaults for LCD / scroll / palette
-    b[0xFF40] = 0x91  // LCDC on, BG on
-    b[0xFF42] = 0x00  // SCY
-    b[0xFF43] = 0x00  // SCX
-    b[0xFF47] = 0xFC  // BGP palette
+    b[0xFF00] = 0xFF
+    b[0xFF40] = 0x91
+    b[0xFF42] = 0x00
+    b[0xFF43] = 0x00
+    b[0xFF47] = 0xFC
   :e
 
   :m loadRom(romBytes)
+    // โหลด ROM ใส่ช่วงต้นของ Memory
     :* (let i = 0; i < romBytes.length; i++)
       :@bytes[i] = romBytes[i]
     :e
   :e
 
   :m rb(addr)
-    :^ :@bytes[addr & 0xFFFF]
+    a := addr & 0xFFFF
+    if (a == 0xFF00)
+      :^ :@joyp | 0x0F
+    :e
+    :^ :@bytes[a]
   :e
 
   :m wb(addr, val)
-    addr = addr & 0xFFFF
-    val  = val & 0xFF
-    :@bytes[addr] = val
+    a := addr & 0xFFFF
+    v := val & 0xFF
 
-    // debug: log การเขียน VRAM ช่วง 0x8000–0x9FFF แบบ limit
-    if (:@debugVram && addr >= 0x8000 && addr < 0xA000)
-      if (:@debugVramCount < :@debugVramMax)
-        console.log(
-          "VRAM write",
-          "addr=0x" + addr.toString(16),
-          "val=" + val
-        )
-        :@debugVramCount++
-        if (:@debugVramCount == :@debugVramMax)
-          console.log("VRAM write log limit reached")
+    // --- FIX 1: Protection ---
+    // ห้ามเขียนทับ ROM (0x0000-0x7FFF)
+    // ยกเว้นกรณีทำ MBC Banking (ซึ่ง Tetris ตัวธรรมดาไม่ต้องใช้)
+    if (a < 0x8000) -> :^
+
+
+    // --- FIX 2: OAM DMA Transfer (0xFF46) ---
+    // จำเป็นมาก ไม่งั้น Sprites (แท่งบล็อก) จะไม่ขยับ/ไม่โชว์
+    if (a == 0xFF46)
+      baseAddr := v << 8
+      // Copy 160 bytes (40 sprites * 4 bytes)
+      :* (let i = 0; i < 160; i++)
+        src := (baseAddr + i) & 0xFFFF
+        :@bytes[0xFE00 + i] = :@bytes[src]
+      :e
+      
+      // DMA จริงๆ กินเวลา 160ms แต่ใน emu แบบง่าย ให้จบเลยก็ได้
+      // แล้วเขียนค่าลง register ไว้ด้วย
+      :@bytes[a] = v
+      :^
+    :e
+
+    // --- JOYP (FF00) ---
+    if (a == 0xFF00)
+      :@joyp = (v & 0xF0) | 0x0F
+      :@bytes[a] = :@joyp
+      :^
+    :e
+
+    // --- IO debug trace ---
+    if (a >= 0xFF00 && a <= 0xFFFF && :@debugIO)
+      if (:@debugIOCount < 2000)
+        pcVal := -1
+        if (:@debugCpu)
+          pcVal = :@debugCpu.pc
         :e
+        console.log("IOWB", "PC=" + pcVal.toString(16), "addr=" + a.toString(16), "val=" + v.toString(16))
+        :@debugIOCount = (:@debugIOCount + 1) | 0
       :e
     :e
-  :e
 
-:e
+    // --- BG map debug ---
+    if (a >= 0x9800 && a <= 0x9FFF && :@debugBG)
+       // ... (debug code เดิม) ...
+    :e
+
+    // ถ้าผ่านทุกเงื่อนไข ก็เขียนลง Memory ได้ (RAM/VRAM/IO)
+    :@bytes[a] = v
+  :e
+:e 
+//End memory 
 
 
 :c GBPPU
@@ -103,187 +143,247 @@ GB_CPU_HZ   :: 4194304
       fb[j + 3] = 255
     :e
   :e
+  
+  
+  // --- Sprite renderer (DMG only, 8×8 / 8×16) ---
+  :m renderSprites()
+    mem := :@mem
+    fb  := :@frameBuffer
+    w   := :@width
+    h   := :@height
 
-    // VRAM debug renderer: ไม่สน LCDC / BGP / SCX/SCY ก่อน
+    if (!mem || !fb) -> :^
+
+    lcdc := mem.rb(0xFF40) & 0xFF
+
+    spriteEnable := (lcdc & 0x02) != 0    // bit1
+    spriteTall   := (lcdc & 0x04) != 0    // bit2 (8×16)
+    if (!spriteEnable) -> :^
+
+    obp0 := mem.rb(0xFF48) & 0xFF   // OBJ palette 0
+    obp1 := mem.rb(0xFF49) & 0xFF   // OBJ palette 1
+
+    // decode DMG obj palette (เหมือน BGP)
+    fn shadeFromObj(ci, attr)
+      pal1 := (attr & 0x10) != 0
+      pal  := pal1 ? obp1 : obp0
+
+      bits  := (pal >> (ci * 2)) & 0x03
+      shade := 0
+      if (bits == 0)
+        shade = 255    // ขาว
+      :? if (bits == 1)
+        shade = 192
+      :? if (bits == 2)
+        shade = 96
+      :e
+        shade = 0      // ดำ
+      :^ shade
+    :e
+
+    // OAM: 40 sprites × 4 bytes @ FE00
+    :* (let i = 0; i < 40; i++)
+      oamBase := 0xFE00 + i * 4
+
+      sprY := (mem.rb(oamBase)     & 0xFF) - 16   // GB spec: Y-16
+      sprX := (mem.rb(oamBase + 1) & 0xFF) - 8    // GB spec: X-8
+      tile :=  mem.rb(oamBase + 2) & 0xFF
+      attr :=  mem.rb(oamBase + 3) & 0xFF
+
+      // นอกจอทั้งก้อน → ข้าม
+      if (sprX <= -8 || sprX >= w || sprY <= -16 || sprY >= h) -> :e
+
+      xFlip := (attr & 0x20) != 0
+      yFlip := (attr & 0x40) != 0
+      // bit7 priority / bit0–2 CGB color ยังไม่ใช้
+
+      height    := spriteTall ? 16 : 8
+      baseTile  := spriteTall ? (tile & 0xFE) : tile   // 8×16: ignore bit0
+
+      :* (let line = 0; line < height; line++)
+        screenY := sprY + line
+        if (screenY < 0 || screenY >= h) -> :e
+
+        row := yFlip ? (height - 1 - line) : line
+        tileIndex := baseTile + (row >= 8 ? 1 : 0)
+        rowY := row & 7
+
+        // sprite ใช้ tile data ที่ 0x8000 เสมอ
+        tileAddr := 0x8000 + tileIndex * 16 + rowY * 2
+
+        low  := mem.rb(tileAddr)
+        high := mem.rb(tileAddr + 1)
+
+        :* (let col = 0; col < 8; col++)
+          screenX := sprX + col
+          if (screenX < 0 || screenX >= w) -> :e
+
+          bitIndex := xFlip ? col : (7 - col)
+
+          b0 := (low  >> bitIndex) & 1
+          b1 := (high >> bitIndex) & 1
+          ci := (b1 << 1) | b0      // 0..3
+
+          // color 0 = โปร่งใส
+          if (ci == 0) -> :e
+
+          shade := shadeFromObj(ci, attr)
+
+          idx := (screenY * w + screenX) * 4
+          fb[idx]     = shade
+          fb[idx + 1] = shade
+          fb[idx + 2] = shade
+          fb[idx + 3] = 255
+        :e
+      :e
+    :e
+  :e
+
+
+  // VRAM debug renderer: ไม่สน LCDC / BGP / SCX/SCY ก่อน
   // อ่าน BG map 0x9800 + tile data 0x8000 → ใช้ colorIndex เป็น shade ตรง ๆ
+  // --- BG + Window renderer (DMG-style) -----------------------
   :m renderBG()
     mem := :@mem
     fb  := :@frameBuffer
     w   := :@width
     h   := :@height
 
-    if (!mem)
-      // ถ้ายังไม่มี memory ให้ล้างจอดำ ๆ ไว้ก่อน
+    if (!mem || !fb) -> :^
+
+    // --- อ่านรีจิสเตอร์จอ ---
+    lcdc := mem.rb(0xFF40) & 0xFF
+    scy  := mem.rb(0xFF42) & 0xFF
+    scx  := mem.rb(0xFF43) & 0xFF
+    wy   := mem.rb(0xFF4A) & 0xFF
+    wx   := mem.rb(0xFF4B) & 0xFF
+    bgp  := mem.rb(0xFF47) & 0xFF
+
+    // bit flags
+    lcdOn     := (lcdc & 0x80) != 0      // ตอนนี้ยังไม่ใช้ปิดจอจริง ๆ
+    winMapSel := (lcdc & 0x40) != 0
+    winEnable := (lcdc & 0x20) != 0
+    tileSel   := (lcdc & 0x10) != 0      // 1 = 0x8000 (unsigned), 0 = 0x8800 (signed, base=0x9000)
+    bgMapSel  := (lcdc & 0x08) != 0
+	
+	// DEBUG: ปิด window ทิ้งทั้งจอ เพื่อตรวจ BG เพียว ๆ
+    //winEnable = :(
+    // bit2 sprite size ไม่ใช้ที่นี่
+    // bit1 sprite enable ไม่ใช้ที่นี่
+    bgEnable  := (lcdc & 0x01) != 0
+
+    bgMapBase  := bgMapSel  ? 0x9C00 : 0x9800
+    winMapBase := winMapSel ? 0x9C00 : 0x9800
+
+    tileDataBase := tileSel ? 0x8000 : 0x9000
+    signedIndex  := !tileSel   // โหมด 0x8800 ใช้ signed index
+
+	// --- แปลง BGP (2-bit per color) → shade 0..255 ---
+	fn shadeFromPal(idx)
+	  bits := (bgp >> (idx * 2)) & 0x03
+
+	  // ใช้ if/else แทน switch (:~) เพราะ :~ ใน compiler ตอนนี้ยังไม่มี break
+	  if (bits == 0)
+		:^ 255    // 00 = ขาว
+	  :? if (bits == 1)
+		:^ 192    // 01
+	  :? if (bits == 2)
+		:^ 96     // 10
+	  :e
+		:^ 0      // 11 = ดำ
+	:e
+
+
+
+    shade0 := shadeFromPal(0)
+    shade1 := shadeFromPal(1)
+    shade2 := shadeFromPal(2)
+    shade3 := shadeFromPal(3)
+
+    // ถ้า BG+Window ปิดหมด → เคลียร์ด้วยสี index0 ไปเลย
+    if (!bgEnable && !winEnable)
       size := w * h
       :* (let i = 0; i < size; i++)
-        j := i * 4
-        fb[j]     = 0
-        fb[j + 1] = 0
-        fb[j + 2] = 0
-        fb[j + 3] = 255
-      :e
-      :^
-    :e
-
-    tileMapBase  := 0x9800   // BG map เดียว (ไม่สน LCDC bit3 ตอนนี้)
-    tileDataBase := 0x8000   // ใช้โหมด unsigned 0..255 ตรง ๆ
-
-    :* (let y = 0; y < h; y++)
-      tileRow := (y >> 3) & 31
-      fineY   := y & 7
-
-      :* (let x = 0; x < w; x++)
-        tileCol := (x >> 3) & 31
-        fineX   := 7 - (x & 7)   // bit 7..0 ซ้าย→ขวา
-
-        mapIndex := tileRow * 32 + tileCol
-        tIndex   := mem.rb(tileMapBase + mapIndex)    // 0..255
-
-        tileAddr := tileDataBase + tIndex * 16
-        lowByte  := mem.rb(tileAddr + fineY * 2)
-        highByte := mem.rb(tileAddr + fineY * 2 + 1)
-
-        bit  := (lowByte  >> fineX) & 1
-        bit2 := (highByte >> fineX) & 1
-        colorIndex := (bit2 << 1) | bit   // 0..3
-
-        // DEBUG: map 0..3 → 0, 85, 170, 255 (ไม่ใช้ BGP เลย)
-        shade := colorIndex * 85
-
-        idx := (y * w + x) * 4
-        fb[idx]     = shade
-        fb[idx + 1] = shade
-        fb[idx + 2] = shade
+        idx := i * 4
+        fb[idx]     = shade0
+        fb[idx + 1] = shade0
+        fb[idx + 2] = shade0
         fb[idx + 3] = 255
       :e
-    :e
-  :e
-
-
-
-  // เรนเดอร์ BG จาก VRAM + tile map
-  // ถ้า LCDC ยังไม่ on จะ fallback เป็น XOR pattern เดิม
-    :m renderBGorigin()
-    mem := :@mem
-    fb  := :@frameBuffer
-    w   := :@width
-    h   := :@height
-
-    if (!mem)
-      size := w * h
-      :* (let i = 0; i < size; i++)
-        j := i * 4
-        fb[j]     = 0
-        fb[j + 1] = 0
-        fb[j + 2] = 0
-        fb[j + 3] = 255
-      :e
       :^
     :e
 
-    lcdc := mem.rb(0xFF40)
-
-    scy := mem.rb(0xFF42)
-    scx := mem.rb(0xFF43)
-    bgp := mem.rb(0xFF47)
-
-    // BG tile map base: 0x9800 หรือ 0x9C00 (ตาม LCDC bit3)
-    tileMapBase := 0x9800
-    if (lcdc & 0x08) tileMapBase = 0x9C00
-
-    // *** TEMP: บังคับใช้ tile data ที่ 0x8000 แบบ unsigned index ***
-    tileDataBase := 0x8000
-    signedIndexMode := :(   // ปิดโหมด signed ไปก่อน
-
-    if (!(lcdc & 0x10))
-      tileDataBase = 0x8800
-      signedIndexMode = :)
-    :e
-
+    winStartX := (wx - 7) & 0xFF   // ตำแหน่งซ้ายของ window บนจอ
 
     :* (let y = 0; y < h; y++)
-      mapY := (y + scy) & 0xFF
-      tileRow := (mapY >> 3) & 31
-      fineY := mapY & 7
+      bgY := (scy + y) & 0xFF
 
       :* (let x = 0; x < w; x++)
-        mapX := (x + scx) & 0xFF
-        tileCol := (mapX >> 3) & 31
-        fineX := 7 - (mapX & 7)   // bit 7..0
+        useWin := :(
+        tX := 0
+        tY := 0
+        tileMapBase := bgMapBase
 
-        mapIndex := tileRow * 32 + tileCol
-        tileIndexAddr := tileMapBase + mapIndex
-        tIndex := mem.rb(tileIndexAddr)  // 0..255
-
-        tileAddr := tileDataBase + tIndex * 16
-
-
-        if (signedIndexMode)
-          if (tIndex >= 128) tIndex = tIndex - 256
-          tileAddr = 0x9000 + tIndex * 16
-        :e
-        if (!signedIndexMode)
-          tileAddr = tileDataBase + tIndex * 16
-        :e
-
-        lowByte  := mem.rb(tileAddr + fineY * 2)
-        highByte := mem.rb(tileAddr + fineY * 2 + 1)
-
-        bit  := (lowByte  >> fineX) & 1
-        bit2 := (highByte >> fineX) & 1
-        colorIndex := (bit2 << 1) | bit
-
-        cvalue := 0
-        :~ colorIndex
-          :! 0
-            cvalue = bgp & 0x03
-          :! 1
-            cvalue = (bgp >> 2) & 0x03
-          :! 2
-            cvalue = (bgp >> 4) & 0x03
-          :! 3
-            cvalue = (bgp >> 6) & 0x03
-          :_
-            cvalue = 0
-        :e
-
-        shade := 0
-        :~ cvalue
-          :! 0
-            shade = 255
-          :! 1
-            shade = 192
-          :! 2
-            shade = 96
-          :! 3
-            shade = 0
-          :_
-            shade = 0
-        :e
-		
-		//debug 
-		if (x == 0 && y == 0 && :@frameDebug && ((:@frameNo & 63) == 0))
-          console.log("BG(0,0)", "tIndex=", tIndex,
-            "tileAddr=0x" + tileAddr.toString(16),
-            "low=", lowByte, "high=", highByte,
-            "bgp=0x" + bgp.toString(16))
-        :e
-		        // DEBUG: log แค่ pixel (0,0) ทุก ๆ 64 เฟรม ถ้าเปิด frameDebug
-        if (x == 0 && y == 0 && :@mem && (typeof _gb !== "undefined") && _gb.frameDebug)
-          if ((_gb.frameNo & 63) == 0)
-            console.log(
-              "DBG PIX (0,0)",
-              "tIndex=", tIndex,
-              "tileAddr=0x" + tileAddr.toString(16),
-              "low=", lowByte,
-              "high=", highByte,
-              "colorIndex=", colorIndex,
-              "BGP=0x" + bgp.toString(16),
-              "shade=", shade
-            )
+        // --- เลือกใช้ Window หรือ BG ---
+        if (winEnable && wy <= 143)
+          if (y >= wy)
+            if (winStartX <= 159 && x >= winStartX)
+              winY := y - wy
+              winX := x - winStartX
+              if (winX >= 0 && winX < 160 && winY >= 0 && winY < 144)
+                useWin = :)
+                tX = winX
+                tY = winY
+                tileMapBase = winMapBase
+              :e
+            :e
           :e
         :e
 
+        if (!useWin)
+          bgX := (scx + x) & 0xFF
+          tX = bgX
+          tY = bgY
+          tileMapBase = bgMapBase
+        :e
+
+        tileRow := (tY >> 3) & 31
+        tileCol := (tX >> 3) & 31
+        mapIndex := (tileRow << 5) + tileCol
+
+        tIndex := mem.rb(tileMapBase + mapIndex) & 0xFF
+
+        // --- แปลง tile index → tile address (รองรับโหมด signed) ---
+        tileAddr := 0
+        if (signedIndex)
+          // sign-extend 8-bit → 32-bit
+          si := (tIndex << 24) >> 24
+          tileAddr = (tileDataBase + si * 16) & 0xFFFF
+        :e
+        if (!signedIndex)
+          tileAddr = (tileDataBase + tIndex * 16) & 0xFFFF
+        :e
+
+        fineY := tY & 7
+        fineX := 7 - (tX & 7)   // bit 7..0 ซ้าย→ขวา
+
+        low  := mem.rb(tileAddr + fineY * 2)
+        high := mem.rb(tileAddr + fineY * 2 + 1)
+
+        bit  := (low  >> fineX) & 1
+        bit2 := (high >> fineX) & 1
+		
+        colorIndex := (bit2 << 1) | bit   // 0..3
+
+        shade := shade0
+        if (colorIndex == 1)
+          shade = shade1
+        :? if (colorIndex == 2)
+          shade = shade2
+        :? if (colorIndex == 3)
+          shade = shade3
+        :e
+
         idx := (y * w + x) * 4
         fb[idx]     = shade
         fb[idx + 1] = shade
@@ -292,10 +392,14 @@ GB_CPU_HZ   :: 4194304
 
       :e
     :e
-
-    // แบบหยาบ ๆ: LY = 0 ตอนต้นเฟรม
-    //mem.wb(0xFF44, 0)
   :e
+
+
+
+
+
+
+
 
   // XOR plasma test pattern เดิม ใช้ fallback เวลา LCD ไม่ on
   :m renderTestPattern()
@@ -504,6 +608,7 @@ GB_CPU_HZ   :: 4194304
     :@ppu := :N GBPPU()
     :@ppu.attachMemory(:@mem)
     :@cpu := :N GBCPU(:@mem, :@ppu)
+    :@mem.attachCpu(:@cpu)
     :@renderer := :N GBWebGLRenderer(canvasId, GB_SCREEN_W, GB_SCREEN_H, GB_SCALE)
 
     // initial basic state (RAM/IO + PPU)
@@ -514,6 +619,11 @@ GB_CPU_HZ   :: 4194304
     :@ppuScanlineCycles := 0
     :@ppuLY := 0
     :@mem.wb(0xFF44, 0)  // LY register เริ่มที่ 0
+	
+    // --- Timer state ---
+    :@divCounter   := 0    // internal 16-bit counter
+    :@divHighCache := 0    // last written FF04
+    :@timerCounter := 0    // accumulate cycles for TIMA
 
     :@running := :(
     :@lastTime := 0
@@ -563,6 +673,7 @@ GB_CPU_HZ   :: 4194304
 
     // 4) วาด BG ลง framebuffer แล้วส่งเข้า WebGL
     :@ppu.renderBG()
+	:@ppu.renderSprites()   
     :@renderer.draw(:@ppu.frameBuffer)
   :e
 
@@ -589,120 +700,174 @@ GB_CPU_HZ   :: 4194304
 
     // วาด tile data จาก 0x8000 เป็น grid ลง canvas 2D
     // วาด VRAM tile 0x8000.. เป็น grid ลง canvas2D
-  :m debugDrawVramTiles(canvasId)
+    :m debugDrawVramTiles(canvasId)
+    mem := :@mem
     canvas := document.getElementById(canvasId)
     if (!canvas) -> :^
     ctx := canvas.getContext("2d")
-    if (!ctx) -> :^
 
-    mem := :@mem
-    if (!mem) -> :^
+    tileSize := 8
+    tilesPerRow := 16
 
-    tileBase := 0x8000
-    tileCount := 256        // 256 tiles แรกพอ
-    tilesAcross := 16
-    tileW := 8
-    tileH := 8
-    scale := 2
+    canvas.width  = tilesPerRow * tileSize
+    canvas.height = tilesPerRow * tileSize
 
-    rows := (tileCount + tilesAcross - 1) / tilesAcross | 0
-
-    canvas.width  = tilesAcross * tileW * scale
-    canvas.height = rows * tileH * scale
-
-    ctx.imageSmoothingEnabled = false
-    ctx.clearRect(0, 0, canvas.width, canvas.height)
-
-    :* (let t = 0; t < tileCount; t++)
-      tx := t % tilesAcross
-      ty := (t / tilesAcross) | 0
-      baseAddr := tileBase + t * 16
+    :* (let t = 0; t < 256; t++)
+      baseX := (t % tilesPerRow) * tileSize
+      baseY := ((t / tilesPerRow) | 0) * tileSize
+      tileAddr := 0x8000 + t * 16
 
       :* (let row = 0; row < 8; row++)
-        low  := mem.rb(baseAddr + row * 2)
-        high := mem.rb(baseAddr + row * 2 + 1)
+        low  := mem.rb(tileAddr + row * 2)
+        high := mem.rb(tileAddr + row * 2 + 1)
 
         :* (let col = 0; col < 8; col++)
           bit  := (low  >> (7 - col)) & 1
           bit2 := (high >> (7 - col)) & 1
-          colorIndex := (bit2 << 1) | bit   // 0..3
+          ci := (bit2 << 1) | bit   // 0..3
+          shade := ci * 85          // ไม่สน BGP
 
-          shade := 0
-          :~ colorIndex
-            :! 0 
-				shade = 255
-            :! 1 
-				shade = 192
-            :! 2 
-				shade = 96
-            :! 3 
-				shade = 0
-          :e
-
-          x := tx * tileW * scale + col * scale
-          y := ty * tileH * scale + row * scale
-
-          ctx.fillStyle = "rgb(" + shade + "," + shade + "," + shade + ")"
-          ctx.fillRect(x, y, scale, scale)
+          ctx.fillStyle = `rgb(${shade},${shade},${shade})`
+          ctx.fillRect(baseX + col, baseY + row, 1, 1)
         :e
       :e
     :e
   :e
 
 
-     :m debugDrawPalettes(canvasId)
-    canvas := document.getElementById(canvasId)
-    if (!canvas) -> :^
-    ctx := canvas.getContext("2d")
-    if (!ctx) -> :^
 
+   :m debugDrawPalettes(canvasId)
     mem := :@mem
-    bgp  := mem.rb(0xFF47)
-    obp0 := mem.rb(0xFF48)
-    obp1 := mem.rb(0xFF49)
+    canvas := document.getElementById(canvasId)
+    if (!canvas || !mem) -> :^
 
-    sw := 20
-    sh := 16
-    width  := 4 * sw + 40
-    height := 3 * sh + 10
+    ctx := canvas.getContext("2d")
+    w := canvas.width
+    h := canvas.height
 
-    canvas.width  = width
-    canvas.height = height
+    // ล้างพื้นหลังดำ
+    ctx.fillStyle = "rgb(0,0,0)"
+    ctx.fillRect(0, 0, w, h)
 
-    ctx.imageSmoothingEnabled = false
-    ctx.clearRect(0, 0, width, height)
-    ctx.font = "12px monospace"
-    ctx.fillStyle = "#ffffff"
-
-    ctx.fillText("BGP",  2, 12)
-    ctx.fillText("OBP0", 2, 12 + sh)
-    ctx.fillText("OBP1", 2, 12 + sh * 2)
-
-    fn drawPalRow(y, pal)
-      :* (let i = 0; i < 4; i++)
-        c := (pal >> (i * 2)) & 0x03
-        shade := 0
-        :~ c
-          :! 0 
-			shade = 255
-          :! 1 
-			shade = 192
-          :! 2 
-			shade = 96
-          :! 3 
-			shade = 0
-        :e
-        x := 40 + i * sw
-        ctx.fillStyle = "rgb(" + shade + "," + shade + "," + shade + ")"
-        ctx.fillRect(x, y, sw, sh)
+    // helper: map 2-bit → shade 0..255 (0 = ขาว, 3 = ดำ)
+    fn shadeFromBits(bits)
+      shade := 0
+      :~ bits
+        :! 0 
+          shade = 255
+		  :/
+        :! 1 
+          shade = 192
+		  :/
+        :! 2 
+          shade = 96
+		  :/
+        :! 3 
+          shade = 0
+		  :/
+        :_ 
+          shade = 0
       :e
-    end
+      :^ shade
+    :e
 
-    drawPalRow(0,      bgp)
-    drawPalRow(sh,     obp0)
-    drawPalRow(sh * 2, obp1)
+    boxW := 40
+    boxH := 20
+    baseX := 10
+    baseY := 10
+
+    // palIndex: 0 = BGP, 1 = OBP0, 2 = OBP1
+    :* (let palIndex = 0; palIndex < 3; palIndex++)
+      pal := 0
+      :~ palIndex
+        :! 0 
+          pal = mem.rb(0xFF47)   // BGP
+		  :/
+        :! 1 
+          pal = mem.rb(0xFF48)   // OBP0
+		  :/
+        :! 2 
+          pal = mem.rb(0xFF49)   // OBP1
+		  :/
+        :_ 
+          pal = 0
+      :e
+
+      y0 := baseY + palIndex * (boxH + 8)
+
+      // ช่องสีใน palette (0..3)
+      :* (let colorIdx = 0; colorIdx < 4; colorIdx++)
+        bits := (pal >> (colorIdx * 2)) & 0x03
+        shade := shadeFromBits(bits)
+
+        x0 := baseX + colorIdx * (boxW + 8)
+        ctx.fillStyle = `rgb(${shade},${shade},${shade})`
+        ctx.fillRect(x0, y0, boxW, boxH)
+      :e
+    :e
   :e
 
+
+
+
+  // cycles = CPU cycles ที่เพิ่งใช้ไป
+  :m tickTimers(cycles)
+    mem := :@mem
+
+    // --- DIV (0xFF04) ---
+    // ถ้าโค้ดฝั่ง CPU เขียนค่าอื่นใส่ FF04 → treat เป็น reset
+    divReg := mem.rb(0xFF04)
+    if (divReg != :@divHighCache)
+      // user write → reset system counter
+      :@divCounter   = 0
+      :@divHighCache = 0
+      mem.wb(0xFF04, 0)
+    :e
+
+    // เพิ่ม internal counter ตาม cycles
+    div := (:@divCounter + cycles) & 0xFFFF
+    :@divCounter = div
+
+    newHigh := (div >> 8) & 0xFF
+    if (newHigh != :@divHighCache)
+      :@divHighCache = newHigh
+      mem.wb(0xFF04, newHigh)
+    :e
+
+    // --- TIMA/TMA/TAC ---
+    tac := mem.rb(0xFF07)
+    if (tac & 0x04)      // bit2: timer enable
+      freqSel := tac & 0x03
+	  tickCycles := 1024   // 00: 4096 Hz
+      // จำนวน CPU cycles ต่อ 1 tick ของ TIMA (approx)
+      if (freqSel == 1)    // 01: 262144 Hz
+        tickCycles = 16 
+      :? if (freqSel == 2) // 10: 65536 Hz
+        tickCycles = 64 
+      :? if (freqSel == 3) // 11: 16384 Hz
+        tickCycles = 256 
+      :e
+
+      acc := :@timerCounter + cycles
+      // อาจ tick ทีละหลายครั้งได้ ถ้า cycles เยอะ
+      :w (acc >= tickCycles)
+        acc -= tickCycles
+        tima := (mem.rb(0xFF05) + 1) & 0xFF
+        if (tima == 0)
+          // overflow → reload TMA + ขอ interrupt
+          tma := mem.rb(0xFF06)
+          mem.wb(0xFF05, tma)
+
+          ifreg := mem.rb(0xFF0F) | 0x04   // bit2 = TIMA
+          mem.wb(0xFF0F, ifreg)
+        else
+          mem.wb(0xFF05, tima)
+        :e
+      :e
+
+      :@timerCounter = acc
+    :e
+  :e
 
 
   :m tickPpu(cycles)
@@ -821,19 +986,92 @@ GB_CPU_HZ   :: 4194304
 
 
 
-  :m runCpu(totalCycles)
+    :m runCpu(totalCycles)
     spent := 0
-    :w (spent < totalCycles)
-      step := :@cpu.step(totalCycles - spent)
-      if (!step)
-        :/
-      :e
-
-      :@tickPpu(step)
+    :* ( ; spent < totalCycles; )
+      step := :@cpu.step()
+      if (step <= 0) step = 4   // safety เผื่ออนาคต
 
       spent += step
+
+      // tick timer + PPU ทุก instruction
+      :@tickTimers(step)
+      :@tickPpu(step)
     :e
+
+        // วาดเฟรมหลังจบ CPU chunk
+    :@ppu.renderBG()
+    :@renderer.draw(:@ppu.frameBuffer)
+
+    // debug Tetris demo
+    if (:@frameDebug)
+      :@frameNo = (:@frameNo + 1) | 0
+
+      // log ทุก 64 เฟรม (จะเห็นตอนมันเปลี่ยน screen 1→2→3 ชัด)
+      if ((:@frameNo & 0x3F) == 0)
+        pc   := :@cpu.pc
+        ly   := :@mem.rb(0xFF44)
+        lcdc := :@mem.rb(0xFF40)
+        bgp  := :@mem.rb(0xFF47)
+        scx  := :@mem.rb(0xFF43)
+        scy  := :@mem.rb(0xFF42)
+        wx   := :@mem.rb(0xFF4B)
+        wy   := :@mem.rb(0xFF4A)
+        ie   := :@mem.rb(0xFFFF)
+        iff  := :@mem.rb(0xFF0F)
+        tima := :@mem.rb(0xFF05)
+        tac  := :@mem.rb(0xFF07)
+        div  := :@mem.rb(0xFF04)
+
+        console.log(
+          "PC=0x" + pc.toString(16),
+          "LY=" + ly,
+          "LCDC=0x" + lcdc.toString(16),
+          "BGP=0x" + bgp.toString(16),
+          "SCX=" + scx,
+          "SCY=" + scy,
+          "WX=" + wx,
+          "WY=" + wy,
+          "IE=0x" + ie.toString(16),
+          "IF=0x" + iff.toString(16),
+          "TIMA=" + tima,
+          "TAC=0x" + tac.toString(16),
+          "DIV=" + div
+        )
+
+        // ----- BG MAP SNAPSHOT รอบมุมซ้ายของจอ -----
+        // ใช้ base เดียวกับ renderBG()
+        bgMapBase := ((lcdc & 0x08) != 0) ? 0x9C00 : 0x9800
+
+        baseRow := (scy >> 3) & 31   // แถว tile ใน BG map ที่ทับ Y บนของจอ
+        baseCol := (scx >> 3) & 31   // คอลัมน์ tile ที่ทับ X ซ้ายของจอ
+		// dump 6 แถวแรกของจอ
+        :* (let r = 0; r < 6; r++)   
+          mapY := (baseRow + r) & 31
+          line := ""
+		  // 16 tile แรกตามแนว X
+          :* (let c = 0; c < 16; c++)  
+            mapX := (baseCol + c) & 31
+            mapIndex := mapY * 32 + mapX
+            tile := :@mem.rb(bgMapBase + mapIndex) & 0xFF
+
+            if (tile < 16)
+              line += "0"
+            :e
+            line += tile.toString(16) + " "
+          :e
+          console.log("BG row", mapY, ":", line)
+        :e
+      :e
+    :e
+
+	
+	
+
   :e
+
+
+
 
 :e
 

@@ -99,8 +99,6 @@ This keeps everything legally clean and respectful.
 
 # ⚡ Running the Emulator
 
-Simply open `rjsgb.html` in a WebGL-capable browser
-or run a local server:
 
 ```
 npx http-server .

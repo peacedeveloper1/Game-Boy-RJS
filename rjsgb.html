@@ -15,33 +15,80 @@
     <canvas id="paletteView" width="200" height="60"></canvas>
     <button id="refreshDebug">Refresh VRAM / Palette</button>
   </div>
+  <br/>
+  <div id="loadRomPanel">  
+  <br />
+    <input type="file" id="romFile" accept=".gb,.gbc" />
+  <br />
+    <button id="loadRomBtn">Load ROM</button>
+ </div>
 	<script src="rjs-compiler.min.js"></script>
-	  <script>
-		// โหลด CPU ก่อน แล้วค่อยโหลดตัว WebGL / Emulator
-		RJS.load("gb_emu_cpu.rjs")
-		  .then(() => RJS.load("gb_emu_webgl.rjs"))
-		  .then(() => {
-			const emu = createGbEmu("gb");
-			window._gb = emu;
+<script>
+  let emu = null;
 
-			// tetris.gb ต้องอยู่โฟลเดอร์เดียวกับ html นี้
-			return emu.loadRomFromUrl("tetris.gb");
-		  })
-		  .then(() => {
-			_gb.start();
-		  })
-		  .catch((err) => {
-			console.error("GBEmu init error:", err);
-		  });
-		  
-		  
-		    document.getElementById("refreshDebug").addEventListener("click", () => {
+  // โหลด CPU ก่อน แล้วค่อยโหลดตัว WebGL / Emulator
+  RJS.load("gb_emu_cpu.rjs")
+    .then(() => RJS.load("gb_emu_webgl.rjs"))
+    .then(() => {
+      emu = createGbEmu("gb");
+      window._gb = emu;
+
+      // default: ลองโหลด tetris.gb ถ้ามี
+      return emu.loadRomFromUrl("tetris.gb");
+    })
+    .then(() => {
+      if (emu) emu.start();
+    })
+    .catch((err) => {
+      console.error("GBEmu init error:", err);
+    });
+
+  // ปุ่ม Refresh VRAM / Palette เดิม
+  document.getElementById("refreshDebug").addEventListener("click", () => {
     if (window._gb) {
       _gb.debugDrawVramTiles("vramView");
       _gb.debugDrawPalettes("paletteView");
     }
   });
-	  </script>
+
+  // --- Loader จากไฟล์ .gb / .gbc ---
+  const romInput = document.getElementById("romFile");
+  const loadBtn  = document.getElementById("loadRomBtn");
+
+  loadBtn.addEventListener("click", () => {
+    if (!window._gb) {
+      alert("Emulator ยังไม่พร้อม");
+      return;
+    }
+    if (!romInput.files || !romInput.files[0]) {
+      alert("เลือกไฟล์ ROM (.gb / .gbc) ก่อน");
+      return;
+    }
+
+    const file = romInput.files[0];
+    const reader = new FileReader();
+
+    reader.onload = (ev) => {
+      const buf = ev.target.result;
+      // หยุดของเก่าก่อน กันเฟรมค้าง
+      _gb.stop && _gb.stop();
+
+      // loadRomFromArrayBuffer ใน GBEmu ใช้อยู่แล้ว
+      _gb.loadRomFromArrayBuffer(buf);
+      _gb.start && _gb.start();
+    };
+
+    reader.readAsArrayBuffer(file);
+  });
+  
+  /*!
+ * © Peacedeveloper. All rights reserved.
+ * https://peacedeveloper1.github.io/rjs/
+ * peacedeveloper@gmail.com
+ * Unauthorized copying, modification, or distribution is prohibited.
+ */
+</script>
+
 
 
 

@@ -1,9 +1,7 @@
 /*!
- * RJS - Revolution JavaScript
  * © Peacedeveloper. All rights reserved.
  * https://peacedeveloper1.github.io/rjs/
  * peacedeveloper@gmail.com
- * This file is part of the RJS language and loader.
  * Unauthorized copying, modification, or distribution is prohibited.
  */
 :c GBCPU
@@ -495,7 +493,7 @@
         :/
 
       :! 0x27   // DAA
-        a = :@a & 0xFF
+        a := :@a & 0xFF
         fOld := :@f
         adj := 0
         carry = ((fOld & 0x10) != 0) ? 1 : 0
@@ -548,9 +546,9 @@
         :/
 
       :! 0x3F   // CCF
-        oldC = ((:@f & 0x10) != 0) ? 1 : 0
-        z = :@f & 0x80
-        newC = (oldC == 0) ? 0x10 : 0
+        oldC := ((:@f & 0x10) != 0) ? 1 : 0
+        z := :@f & 0x80
+        newC := (oldC == 0) ? 0x10 : 0
         :@f = z | newC   // N,H = 0
         cycles = 4
         handled = :)
