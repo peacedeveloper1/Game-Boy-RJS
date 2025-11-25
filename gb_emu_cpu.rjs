@@ -1,9 +1,3 @@
-/*!
- * © Peacedeveloper. All rights reserved.
- * https://peacedeveloper1.github.io/
- * peacedeveloper@gmail.com
- * Unauthorized copying, modification, or distribution is prohibited.
- */
 :c GBCPU
   :n (mem, ppu)
     :@mem := mem

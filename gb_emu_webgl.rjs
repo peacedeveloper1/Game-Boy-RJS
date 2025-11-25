@@ -1,11 +1,5 @@
 // Game Boy WebGL Emulator Skeleton - RJS Full Compact
-/*!
- * © Peacedeveloper. All rights reserved.
- * https://peacedeveloper1.github.io/
- * peacedeveloper@gmail.com
- * Unauthorized copying, modification, or distribution is prohibited.
- */
- 
+
 GB_SCREEN_W :: 160
 GB_SCREEN_H :: 144
 GB_SCALE    :: 4

@@ -1,10 +1,6 @@
 // Game Boy APU (very simplified) for RJS WebGL emulator
-/*!
- * © Peacedeveloper. All rights reserved.
- * https://peacedeveloper1.github.io/
- * peacedeveloper@gmail.com
- * Unauthorized copying, modification, or distribution is prohibited.
- */
+// NOTE: ไม่ cycle-accurate แต่พอให้ได้ยินเพลง (ch1/ch2/ch3/ch4)
+
 :c GBAPU
   :n (mem)
     :@mem        := mem
@@ -16,6 +12,11 @@
     :@ch1Gain    := :$
     :@ch2Osc     := :$
     :@ch2Gain    := :$
+    :@ch3Osc     := :$
+    :@ch3Gain    := :$
+    :@ch4Noise   := :$
+    :@ch4Gain    := :$
+    :@noiseBuf   := :$
 
     :@enabled    := :(
     :@regs       := :N Uint8Array(0x80)   // mirror FFxx สำหรับเสียง
@@ -65,6 +66,40 @@
 
     :@ch2Osc  = ch2Osc
     :@ch2Gain = ch2Gain
+
+    // --- Channel 3 : wave (approx triangle) ---
+    ch3Osc  := ctx.createOscillator()
+    ch3Gain := ctx.createGain()
+    ch3Osc.type = "triangle"
+    ch3Osc.frequency.value = 440
+    ch3Gain.gain.value = 0
+    ch3Osc.connect(ch3Gain)
+    ch3Gain.connect(master)
+    ch3Osc.start()
+
+    :@ch3Osc  = ch3Osc
+    :@ch3Gain = ch3Gain
+
+    // --- Channel 4 : noise (buffer source) ---
+    noiseBuf := ctx.createBuffer(1, :@sampleRate, :@sampleRate)
+    data     := noiseBuf.getChannelData(0)
+    :* (let i = 0; i < data.length; i++)
+      data[i] = (Math.random() * 2.0) - 1.0
+    :e
+
+    noiseSrc := ctx.createBufferSource()
+    noiseSrc.buffer = noiseBuf
+    noiseSrc.loop   = :)
+    ch4Gain  := ctx.createGain()
+    ch4Gain.gain.value = 0
+
+    noiseSrc.connect(ch4Gain)
+    ch4Gain.connect(master)
+    noiseSrc.start()
+
+    :@noiseBuf = noiseBuf
+    :@ch4Noise = noiseSrc
+    :@ch4Gain  = ch4Gain
   :e
 
 
@@ -87,6 +122,8 @@
     // apply state ปัจจุบันของ regs ให้ oscillator ทันที
     :@updateCh1()
     :@updateCh2()
+    :@updateCh3()
+    :@updateCh4()
   :e
 
 
@@ -97,6 +134,12 @@
     :e
     if (:@ch2Gain)
       :@ch2Gain.gain.value = 0
+    :e
+    if (:@ch3Gain)
+      :@ch3Gain.gain.value = 0
+    :e
+    if (:@ch4Gain)
+      :@ch4Gain.gain.value = 0
     :e
   :e
 
@@ -121,6 +164,12 @@
         if (:@ch2Gain)
           :@ch2Gain.gain.value = 0
         :e
+        if (:@ch3Gain)
+          :@ch3Gain.gain.value = 0
+        :e
+        if (:@ch4Gain)
+          :@ch4Gain.gain.value = 0
+        :e
       :e
       :^
     :e
@@ -140,6 +189,18 @@
     // ch2: NR21..NR24 (FF16..FF19)
     if (off >= 0x16 && off <= 0x19)
       :@updateCh2()
+      :^
+    :e
+
+    // ch3: NR30..NR34 (FF1A..FF1E) + wave RAM (FF30..FF3F)
+    if ((off >= 0x1A && off <= 0x1E) || (off >= 0x30 && off <= 0x3F))
+      :@updateCh3()
+      :^
+    :e
+
+    // ch4: NR41..NR44 (FF20..FF23)
+    if (off >= 0x20 && off <= 0x23)
+      :@updateCh4()
       :^
     :e
   :e
@@ -243,6 +304,112 @@
 
     :@ch2Osc.frequency.setTargetAtTime(freq, now, 0.002)
     :@ch2Gain.gain.setTargetAtTime(amp,  now, 0.01)
+  :e
+
+
+  :m updateCh3()
+    if (!:@ctx || !:@ch3Osc || !:@ch3Gain) -> :^
+    if (!:@enabled)
+      :@ch3Gain.gain.value = 0
+      :^
+    :e
+
+    // NR30: DAC power (bit7)
+    nr30 := :@regs[0x1A]
+    if ((nr30 & 0x80) == 0)
+      :@ch3Gain.gain.value = 0
+      :^
+    :e
+
+    nr32 := :@regs[0x1C]
+    nr33 := :@regs[0x1D]
+    nr34 := :@regs[0x1E]
+
+    // volume code bits [6:5]: 0=0%, 1=100%, 2=50%, 3=25%
+    volCode := (nr32 >> 5) & 0x3
+    scale   := 0.0
+
+    if (volCode == 0)
+      scale = 0.0
+    :?
+      :~ volCode
+        :! 1 scale = 1.0
+        :! 2 scale = 0.5
+        :! 3 scale = 0.25
+      :e
+    :e
+
+    if (scale <= 0.0)
+      :@ch3Gain.gain.value = 0
+      :^
+    :e
+
+    raw  := ((nr34 & 0x07) << 8) | nr33
+    freq := 0.0
+
+    if (raw >= 2048)
+      freq = 0.0
+    :?
+      freq = 131072.0 / (2048.0 - raw)
+    :e
+
+    if (freq <= 0.0)
+      :@ch3Gain.gain.value = 0
+      :^
+    :e
+
+    amp := scale * 0.35
+    now := :@ctx.currentTime || 0
+
+    :@ch3Osc.frequency.setTargetAtTime(freq, now, 0.002)
+    :@ch3Gain.gain.setTargetAtTime(amp,  now, 0.01)
+  :e
+
+
+  :m updateCh4()
+    if (!:@ctx || !:@ch4Noise || !:@ch4Gain) -> :^
+    if (!:@enabled)
+      :@ch4Gain.gain.value = 0
+      :^
+    :e
+
+    nr42 := :@regs[0x21]
+    nr43 := :@regs[0x22]
+    nr44 := :@regs[0x23]
+
+    vol := (nr42 >> 4) & 0xF
+    if (vol == 0)
+      :@ch4Gain.gain.value = 0
+      :^
+    :e
+
+    amp := (vol / 15.0) * 0.35
+
+    divCode := nr43 & 0x7
+    shift   := (nr43 >> 4) & 0xF
+
+    baseDiv := 0.5
+    :~ divCode
+      :! 0 baseDiv = 0.5
+      :! 1 baseDiv = 1.0
+      :! 2 baseDiv = 2.0
+      :! 3 baseDiv = 4.0
+      :! 4 baseDiv = 6.0
+      :! 5 baseDiv = 8.0
+      :! 6 baseDiv = 10.0
+      :! 7 baseDiv = 12.0
+    :e
+
+    period := baseDiv * (1 << shift)
+    rate   := 1.0 / period
+
+    if (rate < 0.01) rate = 0.01
+    if (rate > 8.0)  rate = 8.0
+
+    now := :@ctx.currentTime || 0
+
+    :@ch4Noise.playbackRate.setTargetAtTime(rate, now, 0.01)
+    :@ch4Gain.gain.setTargetAtTime(amp,      now, 0.01)
   :e
 
 
